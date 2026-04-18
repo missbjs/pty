@@ -1,0 +1,42 @@
+{
+  "name": "pty",
+  "version": "1.0.1",
+  "description": "",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "pty": "tsx pty.ts",
+    "prebuild": "pnpm version patch",
+    "build": "vite build",
+    "test": "vitest run pty.test.ts"
+  },
+  "bin": {
+    "pty": "./dist/pty.js"
+  },
+  "exports": {
+    ".": {
+      "import": "./dist/pty.js"
+    }
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "packageManager": "pnpm@10.33.0",
+  "approvedBuilds": [
+    "node-pty"
+  ],
+  "dependencies": {
+    "@xterm/headless": "^6.0.0",
+    "node-pty": "^1.1.0",
+    "strip-ansi": "^7.2.0"
+  },
+  "devDependencies": {
+    "@rollup/plugin-commonjs": "^29.0.2",
+    "@rollup/plugin-node-resolve": "^16.0.3",
+    "@types/node": "^25.6.0",
+    "tsx": "^4.21.0",
+    "typescript": "^6.0.2",
+    "vite": "^8.0.8",
+    "vitest": "^4.1.4"
+  }
+}
