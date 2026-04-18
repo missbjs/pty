@@ -53,6 +53,216 @@ export interface PtySpawnOptions {
   term?: string;
 }
 
+// ── Qodercli TUI Screen Parser ────────────────────────────────────────────
+
+/** Structured representation of the qodercli TUI screen */
+export interface QodercliScreen {
+  header: {
+    title: string;       // "Qoder CLI"
+    version: string;     // "0.1.44"
+    cwd: string;         // "/root/qoder-api"
+  } | null;
+  tips: string[];        // Tip lines
+  conversation: QoderMessage[];
+  inputBox: string;      // Text inside the input box
+  statusBar: string;     // Bottom status line (Model, MCP, cwd)
+  raw: string[];         // All non-empty lines for debugging
+}
+
+export interface QoderMessage {
+  type: "user" | "assistant" | "reasoning" | "system";
+  text: string;
+}
+
+/**
+ * Parse the qodercli TUI screen buffer into structured regions.
+ *
+ * Screen layout:
+ *   Lines 0-4:   Header box (╭─╮ border)
+ *   Line 6:      "Tips for getting started:"
+ *   Lines 8-10:  Tips
+ *   Line 12+:    Conversation ("> user", "● reasoning", text)
+ *   Last few:    Input box (╭─╮ border), status bar
+ */
+export function parseQodercliScreen(lines: string[]): QodercliScreen {
+  const trimmed = lines.map(l => l.trimEnd());
+  const nonEmpty = trimmed.filter(l => l.length > 0);
+
+  // ── Header box ──────────────────────────────────────
+  let header: QodercliScreen["header"] = null;
+  const headerIdx = trimmed.findIndex(l => l.includes("Welcome to Qoder CLI"));
+  if (headerIdx !== -1) {
+    const titleLine = trimmed[headerIdx];
+    const titleMatch = titleLine.match(/Welcome to (.+?)!?(\s+\d+\.\d+\.\d+)/);
+    const cwdLine = trimmed.find(l => l.startsWith("cwd:"));
+
+    header = {
+      title: titleMatch?.[1] || "Qoder CLI",
+      version: titleMatch?.[2]?.trim() || "",
+      cwd: cwdLine?.replace("cwd: ", "").trim() || "",
+    };
+  }
+
+  // ── Tips ────────────────────────────────────────────
+  const tips: string[] = [];
+  const tipsHeaderIdx = trimmed.findIndex(l => l.includes("Tips for getting started"));
+  if (tipsHeaderIdx !== -1) {
+    for (let i = tipsHeaderIdx + 1; i < trimmed.length; i++) {
+      const t = trimmed[i].trim();
+      if (/^\d+\.\s/.test(t)) {
+        tips.push(t);
+      } else if (t.length === 0 || t.startsWith("╭") || t.startsWith(">")) {
+        break;
+      }
+    }
+  }
+
+  // ── Input box (bottom of screen) ────────────────────
+  let inputBox = "";
+  let statusBar = "";
+  // Find input box from bottom up
+  for (let i = trimmed.length - 1; i >= 0; i--) {
+    const t = trimmed[i].trim();
+    if (/^Model:/.test(t)) {
+      statusBar = t;
+      break;
+    }
+  }
+  // Find input box content
+  const inputBoxStart = trimmed.findIndex((l, idx) =>
+    idx > 0 && trimmed[idx - 1]?.includes("╭") && l.includes("│") && l.includes(">")
+  );
+  if (inputBoxStart !== -1) {
+    inputBox = trimmed[inputBoxStart].replace(/[│╭╮╰╯─]/g, "").trim().replace(/^>\s*/, "");
+  }
+
+  // ── Conversation ────────────────────────────────────
+  const conversation: QoderMessage[] = [];
+  // Find where conversation starts (after tips / header)
+  let convStart = -1;
+  for (let i = 0; i < trimmed.length; i++) {
+    const t = trimmed[i].trim();
+    if (t.startsWith("> ") && !t.includes("Type your message")) {
+      convStart = i;
+      break;
+    }
+  }
+  // Find where conversation ends (before input box)
+  let convEnd = trimmed.length;
+  for (let i = trimmed.length - 1; i >= 0; i--) {
+    if (trimmed[i].includes("╭") && trimmed[i].includes(">")) {
+      convEnd = i;
+      break;
+    }
+  }
+
+  if (convStart !== -1) {
+    let i = convStart;
+    while (i < convEnd) {
+      const t = trimmed[i].trim();
+      if (!t) { i++; continue; }
+
+      if (t.startsWith("> ")) {
+        // User message — find end (next ● or empty line or input box)
+        const textParts: string[] = [t.slice(2)];
+        i++;
+        while (i < convEnd && trimmed[i].trim() && !trimmed[i].startsWith("●") && !trimmed[i].startsWith("> ") && !trimmed[i].includes("╭")) {
+          textParts.push(trimmed[i].trim());
+          i++;
+        }
+        conversation.push({ type: "user", text: textParts.join(" ").trim() });
+      } else if (t.startsWith("●")) {
+        // Could be reasoning or assistant answer — both use ● prefix
+        const content = t.slice(1).trim();
+        const textParts: string[] = [content];
+        i++;
+        while (i < convEnd && trimmed[i].trim() && !trimmed[i].startsWith("●") && !trimmed[i].startsWith("> ") && !trimmed[i].includes("╭")) {
+          textParts.push(trimmed[i].trim());
+          i++;
+        }
+        const fullText = textParts.join(" ").trim();
+
+        // Reasoning patterns: self-talk, planning, tool descriptions
+        const isReasoning = /^(I should|I'll|This is|Let me|I need|First|Now I|I can|The user wants|I need to|I'll use|I should use|This appears|Looking at|Based on the|To |Let '|I can see|I don't have|I don't see)/i.test(fullText)
+          || /\b(tool|running|execute|use the|file|code)\b/i.test(fullText);
+
+        conversation.push({
+          type: isReasoning ? "reasoning" : "assistant",
+          text: fullText,
+        });
+      } else if (/^(qodercli is|Qoder CLI|This is|I|The |Let me|Based)/i.test(t)) {
+        // Assistant response text
+        const textParts: string[] = [t];
+        i++;
+        while (i < convEnd && trimmed[i].trim() && !trimmed[i].startsWith("●") && !trimmed[i].startsWith("> ") && !trimmed[i].includes("╭") && !/^(Tips|Model:|Press enter|for shortcuts|ctrl\+j)/i.test(trimmed[i].trim())) {
+          textParts.push(trimmed[i].trim());
+          i++;
+        }
+        conversation.push({ type: "assistant", text: textParts.join(" ").trim() });
+      } else {
+        i++;
+      }
+    }
+  }
+
+  return {
+    header,
+    tips,
+    conversation,
+    inputBox,
+    statusBar,
+    raw: nonEmpty,
+  };
+}
+
+// ── ANSI Color Reconstruction ──────────────────────────────────────────
+
+/**
+ * Convert an xterm.js line to a string with ANSI escape codes reconstructed
+ * from cell color attributes.
+ */
+function lineToAnsiString(line: any): string {
+  let result = "";
+  let lastFg: number | null = null;
+  let lastBg: number | null = null;
+
+  for (let col = 0; col < line.length; col++) {
+    const cell = line.getCell(col);
+    const chars = cell?.getChars() ?? "";
+    const fg = cell?.getFgColor() ?? -1;
+    const bg = cell?.getBgColor() ?? -1;
+
+    if (fg !== lastFg || bg !== lastBg) {
+      // Reset if back to defaults
+      if (fg === -1 && bg === -1) {
+        result += "\x1b[0m";
+      } else {
+        const codes: number[] = [];
+        if (fg !== -1 && fg !== lastFg) {
+          codes.push(38, 5, fg);
+        }
+        if (bg !== -1 && bg !== lastBg) {
+          codes.push(48, 5, bg);
+        }
+        if (codes.length > 0) {
+          result += `\x1b[${codes.join(";")}m`;
+        }
+      }
+      lastFg = fg;
+      lastBg = bg;
+    }
+
+    result += chars || " ";
+  }
+
+  // Reset at end of line
+  if (lastFg !== null || lastBg !== null) {
+    result += "\x1b[0m";
+  }
+
+  return line.translateToString(true).endsWith("\n") || line.isWrapped ? result : result;
+}
+
 // ── Service ────────────────────────────────────────────────────────────────
 
 const instances = new Map<string, PtyInstance>();
@@ -61,7 +271,7 @@ const instances = new Map<string, PtyInstance>();
 export function ptySpawn(opts: PtySpawnOptions): PtyInstance {
   const id = randomUUID();
 
-  const cols = opts.cols ?? 200; // wide default to avoid line wrapping
+  const cols = opts.cols ?? 400; // wide default to avoid line wrapping
   const rows = opts.rows ?? 40;
   const term = opts.term ?? "xterm-256color";
 
@@ -80,9 +290,20 @@ export function ptySpawn(opts: PtySpawnOptions): PtyInstance {
 
   const vt = new Terminal({ cols, rows, allowProposedApi: true, scrollback: 10000 });
 
-  // Feed all PTY output into xterm buffer
+  // Feed PTY output into xterm buffer and respond to terminal probes
+  let outputAccum = "";
   ptyProcess.onData((data) => {
+    outputAccum += data;
     vt.write(data);
+
+    // Respond to terminal probe sequences so TUI apps render properly:
+    // \x1b[6n = Cursor Position Request → respond with \x1b[1;1R
+    // \x1b]11;?\x1b\\ = OSC 11 background color query → ignore (no response needed)
+    if (data.includes("\x1b[6n") || data.endsWith("\x1b[")) {
+      // CPR: qodercli and other TUIs probe cursor position before rendering
+      // Respond with row=1, col=1 — the terminal hasn't moved yet
+      setTimeout(() => ptyProcess.write("\x1b[1;1R"), 50);
+    }
   });
 
   const instance: PtyInstance = {
@@ -95,12 +316,6 @@ export function ptySpawn(opts: PtySpawnOptions): PtyInstance {
   };
 
   instances.set(id, instance);
-
-  let outputAccum = "";
-  ptyProcess.onData((data) => {
-    outputAccum += data;
-    vt.write(data);
-  });
 
   ptyProcess.onExit(({ exitCode }) => {
     setTimeout(() => instances.delete(id), 5000);
@@ -116,14 +331,23 @@ export function ptySpawn(opts: PtySpawnOptions): PtyInstance {
 }
 
 /** Get a snapshot of the full buffer */
-export function ptySnapshot(instance: PtyInstance, footerRows: number = 20): BufferSnapshot {
+export function ptySnapshot(instance: PtyInstance, footerRows: number = 20, stripAnsiCodes: boolean = true): BufferSnapshot {
   const buf = instance.terminal.buffer.active;
 
   // Read FULL buffer (scrollback + visible)
   const fullLines: string[] = [];
   for (let i = 0; i < buf.length; i++) {
     const line = buf.getLine(i);
-    fullLines.push(line ? stripAnsi(line.translateToString(true)) : "");
+    if (!line) {
+      fullLines.push("");
+      continue;
+    }
+    if (stripAnsiCodes) {
+      fullLines.push(stripAnsi(line.translateToString(true)));
+    } else {
+      // Reconstruct ANSI codes from xterm cell attributes
+      fullLines.push(lineToAnsiString(line));
+    }
   }
 
   // Visible = last `rows` lines
@@ -221,11 +445,12 @@ Commands:
   <command> [args...]    Command to run (everything before --)
 
 PTY options (after --):
-  --cols <n>             Terminal width (default: auto from TTY, fallback 200)
+  --cols <n>             Terminal width (default: auto from TTY, fallback 400)
   --rows <n>             Terminal height (default: auto from TTY, fallback 40)
   --cwd <dir>            Working directory (default: current)
   --term <name>          Terminal type (default: xterm-256color)
   --wait <ms>            Wait time before first snapshot (default: 1000)
+  --color                Preserve ANSI color codes in snapshot output
   --interactive          Relay TUI to current terminal (default when not --serve)
   --snapshot             Print buffer snapshot once and exit
   --serve                Start HTTP server to accept upstream requests
@@ -240,8 +465,11 @@ Modes (mutually exclusive):
 
 HTTP API (--serve mode):
   GET  /snapshot          Get current screen snapshot
+  GET  /snapshot?color=true  Snapshot with ANSI color codes
   GET  /snapshot/visible  Get visible area only
+  GET  /snapshot/visible?color=true  Visible area with ANSI color codes
   GET  /snapshot/full     Get full buffer with scrollback
+  GET  /snapshot/full?color=true  Full buffer with ANSI color codes
   POST /send              Send keystrokes to PTY { "text": "..." }
   POST /resize            Resize PTY { "cols": 120, "rows": 30 }
   GET  /status            Get PTY process status
@@ -256,21 +484,34 @@ Examples:
       process.exit(0);
     }
 
-    // Known pty-specific flags
-    const PTY_FLAGS = new Set(["--cols", "--rows", "--cwd", "--term", "--wait", "--interactive", "--snapshot", "--serve", "--port", "--host"]);
-
     // Split args at -- : left = command+args, right = pty options
+    const PTY_FLAGS = new Set(["--cols", "--rows", "--cwd", "--term", "--wait", "--color", "--interactive", "--snapshot", "--serve", "--port", "--host"]);
+
     let cmdArgs: string[];
     let ptyOpts: string[];
 
     const explicitSplit = args.indexOf("--");
     if (explicitSplit !== -1) {
       cmdArgs = args.slice(0, explicitSplit);
-      ptyOpts = args.slice(explicitSplit + 1);
+      ptyOpts = [];
+      const valueFlags = new Set(["--cols", "--rows", "--cwd", "--term", "--wait", "--port", "--host"]);
+      for (let i = explicitSplit + 1; i < args.length; i++) {
+        const arg = args[i];
+        if (PTY_FLAGS.has(arg)) {
+          ptyOpts.push(arg);
+          // If this flag takes a value, grab it too
+          if (valueFlags.has(arg) && i + 1 < args.length) {
+            ptyOpts.push(args[++i]);
+          }
+        } else {
+          // Not a pty flag — goes to command
+          cmdArgs.push(arg);
+        }
+      }
     } else {
       // No explicit separator — find the first pty flag and split there
       let firstPtyIdx = -1;
-      for (let i = 1; i < args.length; i++) {
+      for (let i = 0; i < args.length; i++) {
         if (PTY_FLAGS.has(args[i])) {
           firstPtyIdx = i;
           break;
@@ -279,6 +520,9 @@ Examples:
       if (firstPtyIdx === -1) {
         cmdArgs = args;
         ptyOpts = [];
+      } else if (firstPtyIdx === 0) {
+        cmdArgs = [];
+        ptyOpts = args;
       } else {
         cmdArgs = args.slice(0, firstPtyIdx);
         ptyOpts = args.slice(firstPtyIdx);
@@ -294,6 +538,7 @@ Examples:
     let cwd = process.cwd();
     let term = "xterm-256color";
     let waitMs = 1000;
+    let color = false;
     let interactive = false;
     let snapshot = false;
     let serve = false;
@@ -307,6 +552,7 @@ Examples:
         case "--cwd": cwd = ptyOpts[++i]; break;
         case "--term": term = ptyOpts[++i]; break;
         case "--wait": waitMs = parseInt(ptyOpts[++i], 10); break;
+        case "--color": color = true; break;
         case "--interactive": interactive = true; break;
         case "--snapshot": snapshot = true; break;
         case "--serve": serve = true; break;
@@ -316,7 +562,7 @@ Examples:
     }
 
     // Resolve cols/rows from TTY if not specified
-    const defaultCols = 200;
+    const defaultCols = 400;
     const defaultRows = 40;
     const resolvedCols = cols ?? (process.stdout.isTTY ? process.stdout.columns : undefined) ?? defaultCols;
     const resolvedRows = rows ?? (process.stdout.isTTY ? process.stdout.rows : undefined) ?? defaultRows;
@@ -364,11 +610,13 @@ Examples:
         try {
           // GET /snapshot — visible area
           if (req.method === "GET" && pathname === "/snapshot") {
-            const snap = ptySnapshot(instance);
+            const color = url.searchParams.get("color") === "true";
+            const snap = ptySnapshot(instance, 20, !color);
             res.writeHead(200, { "Content-Type": "application/json" });
             return res.end(JSON.stringify({
               visibleText: snap.visibleText,
               visibleLines: snap.visibleLines,
+              screen: parseQodercliScreen(snap.visibleLines),
               cols: instance.cols,
               rows: instance.rows,
               pid: instance.process.pid,
@@ -377,17 +625,20 @@ Examples:
 
           // GET /snapshot/visible
           if (req.method === "GET" && pathname === "/snapshot/visible") {
-            const snap = ptySnapshot(instance);
+            const color = url.searchParams.get("color") === "true";
+            const snap = ptySnapshot(instance, 20, !color);
             res.writeHead(200, { "Content-Type": "application/json" });
             return res.end(JSON.stringify({
               visibleText: snap.visibleText,
               visibleLines: snap.visibleLines,
+              screen: parseQodercliScreen(snap.visibleLines),
             }));
           }
 
           // GET /snapshot/full
           if (req.method === "GET" && pathname === "/snapshot/full") {
-            const snap = ptySnapshot(instance);
+            const color = url.searchParams.get("color") === "true";
+            const snap = ptySnapshot(instance, 20, !color);
             res.writeHead(200, { "Content-Type": "application/json" });
             return res.end(JSON.stringify({
               fullText: snap.fullText,
@@ -395,11 +646,19 @@ Examples:
               scrollbackLines: snap.scrollbackLines,
               visibleText: snap.visibleText,
               footerText: snap.footerText,
+              screen: parseQodercliScreen(snap.visibleLines),
               cols: instance.cols,
               rows: instance.rows,
               baseY: snap.baseY,
               bufLength: snap.bufLength,
             }));
+          }
+
+          // GET /screen — structured qodercli screen parse
+          if (req.method === "GET" && pathname === "/screen") {
+            const snap = ptySnapshot(instance);
+            res.writeHead(200, { "Content-Type": "application/json" });
+            return res.end(JSON.stringify(parseQodercliScreen(snap.visibleLines)));
           }
 
           // POST /send
@@ -479,8 +738,11 @@ Examples:
         console.log(`PTY server listening on http://${host}:${port}`);
         console.log(`Endpoints:`);
         console.log(`  GET  /snapshot          — visible screen`);
+        console.log(`  GET  /snapshot?color=true — visible screen with ANSI color`);
         console.log(`  GET  /snapshot/visible  — visible area`);
+        console.log(`  GET  /snapshot/visible?color=true — visible area with ANSI color`);
         console.log(`  GET  /snapshot/full     — full buffer + scrollback`);
+        console.log(`  GET  /snapshot/full?color=true — full buffer with ANSI color`);
         console.log(`  POST /send              — send keystrokes { "text": "..." }`);
         console.log(`  POST /resize            — resize PTY { "cols": N, "rows": N }`);
         console.log(`  GET  /status            — process status`);
@@ -543,7 +805,8 @@ Examples:
     // ── Snapshot mode ──────────────────────────────────────────────────
     await new Promise((r) => setTimeout(r, waitMs));
 
-    const snap = ptySnapshot(instance);
+    const snap = ptySnapshot(instance, 20, !color);
+    const screen = parseQodercliScreen(snap.visibleLines);
 
     console.log("=== VISIBLE SCREEN ===");
     console.log(snap.visibleText);
@@ -551,6 +814,27 @@ Examples:
     console.log(snap.scrollbackLines.join("\n"));
     console.log("=== END ===");
     console.log(`Buffer: ${snap.bufLength} lines, scroll: ${snap.baseY}`);
+
+    // Show parsed qodercli screen if detected
+    if (screen.header || screen.conversation.length > 0) {
+      console.log("\n=== PARSED SCREEN ===");
+      if (screen.header) {
+        console.log(`Header: ${screen.header.title} ${screen.header.version}`);
+        console.log(`CWD:    ${screen.header.cwd}`);
+      }
+      if (screen.tips.length > 0) {
+        console.log(`Tips:   ${screen.tips.length} tip(s)`);
+      }
+      if (screen.conversation.length > 0) {
+        console.log(`Conversation (${screen.conversation.length} message(s)): `);
+        for (const msg of screen.conversation) {
+          console.log(`  [${msg.type}] ${msg.text.slice(0, 120)}${msg.text.length > 120 ? "..." : ""}`);
+        }
+      }
+      if (screen.statusBar) {
+        console.log(`Status: ${screen.statusBar}`);
+      }
+    }
 
     ptyKill(instance);
     process.exit(0);

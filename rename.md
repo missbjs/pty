@@ -13,9 +13,9 @@ pnpm qodercli [qodercli-args...] [pty-options]
 
 | Mode | How | Description |
 |---|---|---|
-| **Interactive** (default) | no flags | Relay TUI to current terminal, resize passthrough |
-| **Snapshot** | `--snapshot` | Wait, capture buffer, print, exit |
-| **Serve** | `--serve` | HTTP API server for upstream consumers |
+| **Interactive** (default) | no flags | Relay TUI to current terminal, resize passthrough (color preserved) |
+| **Snapshot** | `--snapshot` | Wait, capture buffer, print, exit (ANSI stripped by default) |
+| **Serve** | `--serve` | HTTP API server for upstream consumers (color via `?color=true`) |
 
 ## Flags (after `--` or auto-detected)
 
@@ -26,6 +26,7 @@ pnpm qodercli [qodercli-args...] [pty-options]
 | `--cwd <dir>` | current dir | Working directory |
 | `--term <name>` | xterm-256color | Terminal type |
 | `--wait <ms>` | 1000 | Wait time before snapshot |
+| `--color` | — | Preserve ANSI color codes in snapshot output |
 | `--interactive` | — | Explicit interactive mode |
 | `--snapshot` | — | Single snapshot and exit |
 | `--serve` | — | Start HTTP server |
@@ -43,6 +44,7 @@ pnpm pty vim file.txt
 # Snapshot mode
 pnpm pty top -- --snapshot
 pnpm pty top -- --snapshot --wait 2000 --cols 100 --rows 15
+pnpm pty top -- --snapshot --color        # preserve ANSI color codes
 
 # HTTP server mode
 pnpm pty top -- --serve --port 3001
@@ -62,8 +64,11 @@ pnpm qodercli --model auto -w /tmp --cols 120 --serve --port 3001
 | GET | `/health` | Health check |
 | GET | `/status` | PTY process info |
 | GET | `/snapshot` | Visible screen as JSON |
+| GET | `/snapshot?color=true` | Visible screen with ANSI color codes |
 | GET | `/snapshot/visible` | Visible area only |
+| GET | `/snapshot/visible?color=true` | Visible area with ANSI color codes |
 | GET | `/snapshot/full` | Full buffer + scrollback |
+| GET | `/snapshot/full?color=true` | Full buffer + scrollback with ANSI color codes |
 | POST | `/send` | Send keystrokes `{"text": "..."}` |
 | POST | `/resize` | Resize PTY `{"cols": N, "rows": N}` |
 
@@ -80,8 +85,13 @@ const instance = ptySpawn({
 
 await new Promise(r => setTimeout(r, 1000));
 
+// Default: strip ANSI codes
 const snap = ptySnapshot(instance);
 console.log(snap.visibleText);
+
+// Preserve ANSI color codes: ptySnapshot(instance, footerRows, stripAnsiCodes)
+const coloredSnap = ptySnapshot(instance, 20, false);
+console.log(coloredSnap.visibleText); // contains ANSI escape sequences
 
 ptyKill(instance);
 ```
@@ -90,4 +100,4 @@ ptyKill(instance);
 
 - **node-pty** — spawns the process in a real PTY
 - **@xterm/headless** — parses ANSI escape sequences, maintains VT buffer
-- **Snapshot** reads the xterm buffer line-by-line, strips ANSI, returns structured sections (visible, scrollback, footer)
+- **Snapshot** reads the xterm buffer line-by-line, strips ANSI by default (controlled by `stripAnsiCodes` param), returns structured sections (visible, scrollback, footer)

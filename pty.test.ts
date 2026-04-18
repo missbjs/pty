@@ -41,7 +41,7 @@ describe("pty.ts — generic PTY service", () => {
 
   it("uses default dimensions when not specified", () => {
     const inst = ptySpawn({ command: "sleep", args: ["60"] });
-    expect(inst.cols).toBe(200);
+    expect(inst.cols).toBe(400);
     expect(inst.rows).toBe(40);
     ptyKill(inst);
   });
@@ -109,11 +109,31 @@ describe("pty.ts — generic PTY service", () => {
     await new Promise((r) => setTimeout(r, 1000));
 
     const snap = ptySnapshot(lsInst);
-    // Snapshots should be stripped
+    // Snapshots should be stripped by default
     const escRegex = /\x1b\[[0-9;]*[a-zA-Z]/;
     for (const line of snap.fullLines) {
       expect(escRegex.test(line)).toBe(false);
     }
+
+    ptyKill(lsInst);
+  });
+
+  it("preserves ANSI codes when stripAnsiCodes is false", async () => {
+    // Spawn a process that outputs ANSI codes
+    const lsInst = ptySpawn({
+      command: "ls",
+      args: ["--color=always", "/"],
+      cols: 120,
+      rows: 30,
+    });
+
+    await new Promise((r) => setTimeout(r, 1000));
+
+    const snap = ptySnapshot(lsInst, 20, false);
+    // Snapshots should preserve ANSI codes
+    const escRegex = /\x1b\[[0-9;]*[a-zA-Z]/;
+    const hasColor = snap.fullLines.some((line) => escRegex.test(line));
+    expect(hasColor).toBe(true);
 
     ptyKill(lsInst);
   });
@@ -235,7 +255,7 @@ describe("pty.ts — generic PTY service", () => {
 
   it("correctly splits command args from pty flags (no -- separator)", () => {
     // Simulate the CLI arg splitting logic
-    const PTY_FLAGS = new Set(["--cols", "--rows", "--cwd", "--term", "--wait", "--interactive", "--snapshot", "--serve", "--port", "--host"]);
+    const PTY_FLAGS = new Set(["--cols", "--rows", "--cwd", "--term", "--wait", "--color", "--interactive", "--snapshot", "--serve", "--port", "--host"]);
 
     const args = ["--model", "auto", "-w", "/tmp", "--snapshot", "--wait", "2000"];
     let firstPtyIdx = -1;
@@ -262,7 +282,7 @@ describe("pty.ts — generic PTY service", () => {
   });
 
   it("handles no pty flags at all", () => {
-    const PTY_FLAGS = new Set(["--cols", "--rows", "--cwd", "--term", "--wait", "--interactive", "--snapshot", "--serve", "--port", "--host"]);
+    const PTY_FLAGS = new Set(["--cols", "--rows", "--cwd", "--term", "--wait", "--color", "--interactive", "--snapshot", "--serve", "--port", "--host"]);
 
     const args = ["ls", "-la", "/tmp"];
     let firstPtyIdx = -1;

@@ -1,12 +1,12 @@
 {
   "name": "pty",
-  "version": "1.0.1",
+  "version": "1.0.3",
   "description": "",
   "main": "index.js",
   "type": "module",
   "scripts": {
     "pty": "tsx pty.ts",
-    "prebuild": "pnpm version patch",
+    "prebuild": "pnpm version patch --no-git-tag-version",
     "build": "vite build",
     "test": "vitest run pty.test.ts"
   },
