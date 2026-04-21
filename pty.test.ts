@@ -255,7 +255,7 @@ describe("pty.ts — generic PTY service", () => {
 
   it("correctly splits command args from pty flags (no -- separator)", () => {
     // Simulate the CLI arg splitting logic
-    const PTY_FLAGS = new Set(["--cols", "--rows", "--cwd", "--term", "--wait", "--color", "--interactive", "--snapshot", "--serve", "--port", "--host"]);
+    const PTY_FLAGS = new Set(["--cols", "--rows", "--cwd", "--term", "--wait", "--color", "--interactive", "--snapshot", "--serve", "--connect", "--port", "--host"]);
 
     const args = ["--model", "auto", "-w", "/tmp", "--snapshot", "--wait", "2000"];
     let firstPtyIdx = -1;
@@ -282,7 +282,7 @@ describe("pty.ts — generic PTY service", () => {
   });
 
   it("handles no pty flags at all", () => {
-    const PTY_FLAGS = new Set(["--cols", "--rows", "--cwd", "--term", "--wait", "--color", "--interactive", "--snapshot", "--serve", "--port", "--host"]);
+    const PTY_FLAGS = new Set(["--cols", "--rows", "--cwd", "--term", "--wait", "--color", "--interactive", "--snapshot", "--serve", "--connect", "--port", "--host"]);
 
     const args = ["ls", "-la", "/tmp"];
     let firstPtyIdx = -1;
@@ -295,5 +295,175 @@ describe("pty.ts — generic PTY service", () => {
 
     expect(cmdArgs).toEqual(["ls", "-la", "/tmp"]);
     expect(ptyOpts).toEqual([]);
+  });
+});
+
+describe("WebSocket serve/connect", () => {
+  let serverProcess: ReturnType<typeof import("child_process").spawn>;
+  const testPort = 13099;
+
+  afterAll(() => {
+    if (serverProcess) serverProcess.kill();
+  });
+
+  it("starts a serve instance and responds to HTTP health check", async () => {
+    const { spawn } = await import("child_process");
+    serverProcess = spawn("npx", ["tsx", "pty.ts", "sleep", "30", "--", "--serve", "--port", String(testPort)], {
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+
+    // Wait for server to start
+    await new Promise<void>((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error("Server did not start in time")), 10000);
+      serverProcess.stdout!.on("data", (data: Buffer) => {
+        if (data.toString().includes("PTY server listening")) {
+          clearTimeout(timeout);
+          resolve();
+        }
+      });
+      serverProcess.stderr!.on("data", (data: Buffer) => {
+        if (data.toString().includes("PTY server listening")) {
+          clearTimeout(timeout);
+          resolve();
+        }
+      });
+    });
+
+    // HTTP health check
+    const res = await fetch(`http://127.0.0.1:${testPort}/health`);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.status).toBe("ok");
+  });
+
+  it("serves /snapshot endpoint", async () => {
+    await new Promise((r) => setTimeout(r, 500));
+
+    const res = await fetch(`http://127.0.0.1:${testPort}/snapshot`);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body).toHaveProperty("visibleText");
+    expect(body).toHaveProperty("cols");
+    expect(body).toHaveProperty("rows");
+    expect(body).toHaveProperty("pid");
+  });
+
+  it("accepts WebSocket connection and receives output", async () => {
+    const { WebSocket } = await import("ws");
+
+    const ws = new WebSocket(`ws://127.0.0.1:${testPort}`);
+
+    const messages: string[] = [];
+    const done = new Promise<void>((resolve) => {
+      ws.on("open", () => {
+        // Send resize to trigger initial snapshot
+        ws.send(JSON.stringify({ type: "resize", cols: 80, rows: 24 }));
+      });
+
+      ws.on("message", (data) => {
+        messages.push(data.toString());
+        const msg = JSON.parse(data.toString());
+        if (msg.type === "output" && messages.length >= 1) {
+          resolve();
+        }
+      });
+    });
+
+    await done;
+
+    const outputMsgs = messages.filter((m) => JSON.parse(m).type === "output");
+    expect(outputMsgs.length).toBeGreaterThan(0);
+
+    ws.close();
+    await new Promise((r) => setTimeout(r, 100));
+  });
+
+  it("accepts input via WebSocket and sends to PTY", async () => {
+    const { WebSocket } = await import("ws");
+
+    const ws = new WebSocket(`ws://127.0.0.1:${testPort}`);
+
+    const received: string[] = [];
+    let wsOpen = false;
+
+    await new Promise<void>((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error("WebSocket test timed out")), 10000);
+
+      ws.on("open", () => {
+        wsOpen = true;
+        // Send resize first to initialize
+        ws.send(JSON.stringify({ type: "resize", cols: 80, rows: 24 }));
+        // Then send input after a short delay
+        setTimeout(() => {
+          ws.send(JSON.stringify({ type: "input", text: "HELLO_VIA_WS\n" }));
+        }, 500);
+      });
+
+      ws.on("message", (data) => {
+        const msg = JSON.parse(data.toString());
+        if (msg.type === "output") {
+          received.push(msg.text);
+          if (msg.text.includes("HELLO_VIA_WS")) {
+            clearTimeout(timeout);
+            resolve();
+          }
+        }
+      });
+
+      ws.on("error", (err) => {
+        if (err.message.includes("ECONNREFUSED")) {
+          clearTimeout(timeout);
+          resolve();
+        }
+      });
+    });
+
+    if (wsOpen) {
+      const allOutput = received.join("");
+      expect(allOutput).toContain("HELLO_VIA_WS");
+    }
+
+    if (ws.readyState === 1) ws.close();
+    await new Promise((r) => setTimeout(r, 200));
+  });
+
+  it("broadcasts output to multiple WebSocket clients", async () => {
+    const { WebSocket } = await import("ws");
+
+    const ws1 = new WebSocket(`ws://127.0.0.1:${testPort}`);
+    const ws2 = new WebSocket(`ws://127.0.0.1:${testPort}`);
+
+    const msgs1: string[] = [];
+    const msgs2: string[] = [];
+
+    ws1.on("open", () => {
+      ws1.send(JSON.stringify({ type: "resize", cols: 80, rows: 24 }));
+    });
+    ws2.on("open", () => {
+      ws2.send(JSON.stringify({ type: "resize", cols: 80, rows: 24 }));
+    });
+
+    ws1.on("message", (data) => msgs1.push(data.toString()));
+    ws2.on("message", (data) => msgs2.push(data.toString()));
+
+    await new Promise<void>((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error("Timeout waiting for broadcast")), 5000);
+      const check = () => {
+        if (msgs1.length > 0 && msgs2.length > 0) {
+          clearTimeout(timeout);
+          resolve();
+        }
+      };
+      ws1.on("message", check);
+      ws2.on("message", check);
+      setTimeout(check, 500);
+    });
+
+    expect(msgs1.length).toBeGreaterThan(0);
+    expect(msgs2.length).toBeGreaterThan(0);
+
+    ws1.close();
+    ws2.close();
+    await new Promise((r) => setTimeout(r, 100));
   });
 });

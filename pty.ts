@@ -5,6 +5,7 @@ import * as pty from "node-pty";
 import xtermHeadless from "@xterm/headless";
 import stripAnsi from "strip-ansi";
 import { randomUUID } from "crypto";
+import { WebSocketServer, WebSocket as WsClient } from "ws";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const Terminal = (xtermHeadless as any).Terminal;
@@ -53,6 +54,12 @@ export interface PtySpawnOptions {
   term?: string;
 }
 
+/** Extract the first fg color integer from a line that may contain ANSI codes */
+export function extractLineColor(line: string): number | null {
+  const match = /\x1b\[38;5;(\d+)m/.exec(line);
+  return match ? parseInt(match[1], 10) : null;
+}
+
 // ── Qodercli TUI Screen Parser ────────────────────────────────────────────
 
 /** Structured representation of the qodercli TUI screen */
@@ -72,6 +79,8 @@ export interface QodercliScreen {
 export interface QoderMessage {
   type: "user" | "assistant" | "reasoning" | "system";
   text: string;
+  /** Raw fg color integer from ANSI codes (app-specific interpretation belongs in the consumer) */
+  color?: number;
 }
 
 /**
@@ -84,7 +93,7 @@ export interface QoderMessage {
  *   Line 12+:    Conversation ("> user", "● reasoning", text)
  *   Last few:    Input box (╭─╮ border), status bar
  */
-export function parseQodercliScreen(lines: string[]): QodercliScreen {
+export function parseQodercliScreen(lines: string[], colorLines?: string[]): QodercliScreen {
   const trimmed = lines.map(l => l.trimEnd());
   const nonEmpty = trimmed.filter(l => l.length > 0);
 
@@ -163,16 +172,19 @@ export function parseQodercliScreen(lines: string[]): QodercliScreen {
       if (!t) { i++; continue; }
 
       if (t.startsWith("> ")) {
-        // User message — find end (next ● or empty line or input box)
+        const lineColor = colorLines ? extractLineColor(colorLines[i] || "") : undefined;
         const textParts: string[] = [t.slice(2)];
         i++;
         while (i < convEnd && trimmed[i].trim() && !trimmed[i].startsWith("●") && !trimmed[i].startsWith("> ") && !trimmed[i].includes("╭")) {
           textParts.push(trimmed[i].trim());
           i++;
         }
-        conversation.push({ type: "user", text: textParts.join(" ").trim() });
+        const msg: QoderMessage = { type: "user", text: textParts.join(" ").trim() };
+        if (lineColor != null) msg.color = lineColor;
+        conversation.push(msg);
       } else if (t.startsWith("●")) {
         // Could be reasoning or assistant answer — both use ● prefix
+        const lineColor = colorLines ? extractLineColor(colorLines[i] || "") : undefined;
         const content = t.slice(1).trim();
         const textParts: string[] = [content];
         i++;
@@ -182,23 +194,27 @@ export function parseQodercliScreen(lines: string[]): QodercliScreen {
         }
         const fullText = textParts.join(" ").trim();
 
-        // Reasoning patterns: self-talk, planning, tool descriptions
+        // Reasoning patterns: self-talk, planning, tool descriptions (text heuristic fallback)
         const isReasoning = /^(I should|I'll|This is|Let me|I need|First|Now I|I can|The user wants|I need to|I'll use|I should use|This appears|Looking at|Based on the|To |Let '|I can see|I don't have|I don't see)/i.test(fullText)
           || /\b(tool|running|execute|use the|file|code)\b/i.test(fullText);
 
-        conversation.push({
+        const msg: QoderMessage = {
           type: isReasoning ? "reasoning" : "assistant",
           text: fullText,
-        });
+        };
+        if (lineColor != null) msg.color = lineColor;
+        conversation.push(msg);
       } else if (/^(qodercli is|Qoder CLI|This is|I|The |Let me|Based)/i.test(t)) {
-        // Assistant response text
+        const lineColor = colorLines ? extractLineColor(colorLines[i] || "") : undefined;
         const textParts: string[] = [t];
         i++;
         while (i < convEnd && trimmed[i].trim() && !trimmed[i].startsWith("●") && !trimmed[i].startsWith("> ") && !trimmed[i].includes("╭") && !/^(Tips|Model:|Press enter|for shortcuts|ctrl\+j)/i.test(trimmed[i].trim())) {
           textParts.push(trimmed[i].trim());
           i++;
         }
-        conversation.push({ type: "assistant", text: textParts.join(" ").trim() });
+        const msg: QoderMessage = { type: "assistant", text: textParts.join(" ").trim() };
+        if (lineColor != null) msg.color = lineColor;
+        conversation.push(msg);
       } else {
         i++;
       }
@@ -430,7 +446,6 @@ process.on("SIGTERM", () => { ptyCleanup(); process.exit(1); });
 //   tsx src/services/pty.ts top
 //   tsx src/services/pty.ts htop
 //   tsx src/services/pty.ts ls -la
-//   tsx src/services/pty.ts qodercli -- --model auto -w /path
 //   tsx src/services/pty.ts python -- -c "print('hello')"
 
 if (import.meta.url === `file://${process.argv[1]}`) {
@@ -453,15 +468,17 @@ PTY options (after --):
   --color                Preserve ANSI color codes in snapshot output
   --interactive          Relay TUI to current terminal (default when not --serve)
   --snapshot             Print buffer snapshot once and exit
-  --serve                Start HTTP server to accept upstream requests
-  --port <n>             Server port for --serve (default: 3000)
+  --serve                Start HTTP + WebSocket server
+  --connect              Connect to an existing PTY server (no command needed)
+  --port <n>             Server port for --serve / --connect (default: 3000)
   --host <addr>          Bind address for --serve (default: 127.0.0.1)
 
 Modes (mutually exclusive):
   (none)                 Interactive passthrough to current terminal
   --interactive          Same as above, explicit
   --snapshot             Single snapshot and exit
-  --serve                HTTP API server for upstream consumers
+  --serve                HTTP API + WebSocket server (spawn app + broadcast)
+  --connect              WebSocket client to existing --serve instance
 
 HTTP API (--serve mode):
   GET  /snapshot          Get current screen snapshot
@@ -476,16 +493,17 @@ HTTP API (--serve mode):
   GET  /health            Health check
 
 Examples:
-  pnpm pty top
-  pnpm pty top -- --interactive
-  pnpm pty qodercli -- --serve --port 3001
-  pnpm pty htop -- --serve --host 0.0.0.0 --port 8080
-  pnpm pty vim file.txt -- --cols 120 --rows 30 --snapshot`);
+  pnpm dev top
+  pnpm dev top -- --interactive
+  pnpm dev htop -- --serve --host 0.0.0.0 --port 8080
+  pnpm dev vim file.txt -- --cols 120 --rows 30 --snapshot
+  pnpm dev top -- --serve --port 3000       # spawn top + serve
+  pnpm dev -- --connect --port 3000         # connect to existing server`);
       process.exit(0);
     }
 
     // Split args at -- : left = command+args, right = pty options
-    const PTY_FLAGS = new Set(["--cols", "--rows", "--cwd", "--term", "--wait", "--color", "--interactive", "--snapshot", "--serve", "--port", "--host"]);
+    const PTY_FLAGS = new Set(["--cols", "--rows", "--cwd", "--term", "--wait", "--color", "--interactive", "--snapshot", "--serve", "--connect", "--port", "--host"]);
 
     let cmdArgs: string[];
     let ptyOpts: string[];
@@ -542,6 +560,7 @@ Examples:
     let interactive = false;
     let snapshot = false;
     let serve = false;
+    let connect = false;
     let port = 3000;
     let host = "127.0.0.1";
 
@@ -556,6 +575,7 @@ Examples:
         case "--interactive": interactive = true; break;
         case "--snapshot": snapshot = true; break;
         case "--serve": serve = true; break;
+        case "--connect": connect = true; break;
         case "--port": port = parseInt(ptyOpts[++i], 10); break;
         case "--host": host = ptyOpts[++i]; break;
       }
@@ -568,7 +588,11 @@ Examples:
     const resolvedRows = rows ?? (process.stdout.isTTY ? process.stdout.rows : undefined) ?? defaultRows;
 
     // Determine mode
-    if (serve) {
+    if (connect) {
+      interactive = false;
+      snapshot = false;
+      serve = false;
+    } else if (serve) {
       interactive = false;
       snapshot = false;
     } else if (snapshot) {
@@ -576,6 +600,81 @@ Examples:
     } else {
       // Default: interactive passthrough
       interactive = true;
+    }
+
+    // ── Connect mode (WebSocket client) ────────────────────────────────
+    if (connect) {
+      const resolvedCols = cols ?? (process.stdout.isTTY ? process.stdout.columns : undefined);
+      const resolvedRows = rows ?? (process.stdout.isTTY ? process.stdout.rows : undefined);
+
+      // Set up stdin first
+      if (process.stdin.isTTY) process.stdin.setRawMode(true);
+      process.stdin.resume();
+
+      const ws = new WsClient(`ws://${host}:${port}`);
+
+      // Stdin → WebSocket (set up early, before connection)
+      process.stdin.on("data", (data) => {
+        const key = data.toString();
+        if (key === "\x03") {
+          if (process.stdin.isTTY) process.stdin.setRawMode(false);
+          ws.close();
+          process.exit(0);
+          return;
+        }
+        if (ws.readyState === WsClient.OPEN) {
+          ws.send(JSON.stringify({ type: "input", text: key }));
+        }
+      });
+
+      ws.on("open", () => {
+        // Tell server our terminal dimensions
+        if (resolvedCols && resolvedRows) {
+          ws.send(JSON.stringify({ type: "resize", cols: resolvedCols, rows: resolvedRows }));
+        }
+        process.stderr.write(`Connected to PTY server at ws://${host}:${port}\n`);
+        process.stderr.write(`Mode: remote interactive (Ctrl+C to disconnect)\n\n`);
+      });
+
+      ws.on("message", (data) => {
+        const msg = JSON.parse(data.toString());
+        if (msg.type === "output") {
+          process.stdout.write(msg.text);
+        } else if (msg.type === "exit") {
+          if (process.stdin.isTTY) process.stdin.setRawMode(false);
+          process.stderr.write(`\n\nRemote process exited with code ${msg.exitCode}\n`);
+          process.exit(0);
+        } else if (msg.type === "ready") {
+          // Server acknowledges connection
+        }
+      });
+
+      ws.on("close", () => {
+        if (process.stdin.isTTY) process.stdin.setRawMode(false);
+        process.stderr.write("\nDisconnected from PTY server\n");
+        process.exit(0);
+      });
+
+      ws.on("error", (err) => {
+        process.stderr.write(`Connection error: ${err.message}\n`);
+        if (process.stdin.isTTY) process.stdin.setRawMode(false);
+        process.exit(1);
+      });
+
+      // Handle resize → send to server
+      if (process.stdout.isTTY) {
+        process.stdout.on("resize", () => {
+          if (ws.readyState === WsClient.OPEN) {
+            ws.send(JSON.stringify({
+              type: "resize",
+              cols: process.stdout.columns,
+              rows: process.stdout.rows,
+            }));
+          }
+        });
+      }
+
+      return;
     }
 
     console.log(`Spawning: ${command} ${cmdRest.join(" ")}`);
@@ -637,21 +736,31 @@ Examples:
 
           // GET /snapshot/full
           if (req.method === "GET" && pathname === "/snapshot/full") {
-            const color = url.searchParams.get("color") === "true";
-            const snap = ptySnapshot(instance, 20, !color);
-            res.writeHead(200, { "Content-Type": "application/json" });
-            return res.end(JSON.stringify({
+            const withColor = url.searchParams.get("color") === "true";
+            const snap = ptySnapshot(instance, 20, true); // always stripped for text logic
+            const payload: Record<string, unknown> = {
               fullText: snap.fullText,
               fullLines: snap.fullLines,
+              visibleLines: snap.visibleLines,
               scrollbackLines: snap.scrollbackLines,
               visibleText: snap.visibleText,
               footerText: snap.footerText,
-              screen: parseQodercliScreen(snap.visibleLines),
               cols: instance.cols,
               rows: instance.rows,
               baseY: snap.baseY,
               bufLength: snap.bufLength,
-            }));
+            };
+            if (withColor) {
+              const colorSnap = ptySnapshot(instance, 20, false);
+              payload.fullLinesColor = colorSnap.fullLines;
+              payload.visibleLinesColor = colorSnap.visibleLines;
+              // Parse with color lines so messages carry the color field
+              payload.screen = parseQodercliScreen(snap.fullLines, colorSnap.fullLines);
+            } else {
+              payload.screen = parseQodercliScreen(snap.fullLines);
+            }
+            res.writeHead(200, { "Content-Type": "application/json" });
+            return res.end(JSON.stringify(payload));
           }
 
           // GET /screen — structured qodercli screen parse
@@ -747,17 +856,76 @@ Examples:
         console.log(`  POST /resize            — resize PTY { "cols": N, "rows": N }`);
         console.log(`  GET  /status            — process status`);
         console.log(`  GET  /health            — health check`);
+        console.log(`  WS   ws://${host}:${port}           — WebSocket for real-time I/O`);
         console.log(`\nCtrl+C to stop`);
+      });
+
+      // ── WebSocket server for real-time multi-client ──────────────────
+      const wss = new WebSocketServer({ server });
+      const clients = new Set<WsClient>();
+
+      // Broadcast PTY output to all connected clients
+      instance.process.onData((data) => {
+        const payload = JSON.stringify({ type: "output", text: data });
+        for (const client of clients) {
+          if (client.readyState === WsClient.OPEN) {
+            // Check if this client has been initialized (sent resize)
+            // Access the pending buffer from the connection handler
+            if ((client as any)._ptyInitialized) {
+              client.send(payload);
+            } else {
+              // Buffer the output until resize arrives
+              if (!(client as any)._ptyPending) (client as any)._ptyPending = [];
+              (client as any)._ptyPending.push(data);
+            }
+          }
+        }
+      });
+
+      wss.on("connection", (ws) => {
+        clients.add(ws);
+        console.log(`Client connected (${clients.size} total)`);
+
+        // Buffer realtime output until client sends its dimensions
+        ws.on("message", (data) => {
+          try {
+            const msg = JSON.parse(data.toString());
+            if (msg.type === "input" && msg.text) {
+              ptySend(instance, msg.text);
+            } else if (msg.type === "resize" && msg.cols && msg.rows) {
+              // Resize PTY to client dimensions (affects all clients)
+              ptyResize(instance, msg.cols, msg.rows);
+              // Send visible snapshot at the new size (preserve colors)
+              const snap = ptySnapshot(instance, msg.rows, false);
+              ws.send(JSON.stringify({ type: "output", text: snap.visibleText }));
+              // Flush any buffered realtime output
+              const pending = (ws as any)._ptyPending;
+              if (pending && pending.length > 0) {
+                for (const chunk of pending) {
+                  ws.send(JSON.stringify({ type: "output", text: chunk }));
+                }
+              }
+              (ws as any)._ptyInitialized = true;
+            }
+          } catch {}
+        });
+
+        ws.on("close", () => {
+          clients.delete(ws);
+          console.log(`Client disconnected (${clients.size} remaining)`);
+        });
       });
 
       process.on("SIGINT", () => {
         console.log("\nShutting down...");
         ptyKill(instance);
+        wss.close();
         server.close();
         process.exit(0);
       });
       process.on("SIGTERM", () => {
         ptyKill(instance);
+        wss.close();
         server.close();
         process.exit(0);
       });
