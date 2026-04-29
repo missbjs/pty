@@ -105,7 +105,7 @@ Mode: remote interactive (Ctrl+C to disconnect)
   Swp[|||||3.84G/12.0G]
 
   PID USER      PRI  NI  VIRT   RES   SHR S CPU% MEM%   TIME+ Command
- 1056 root       20   0 1340M  82M  29M S  0.0  0.6  5:23.69 qodercli
+ 1056 root       20   0 1340M  82M  29M S  0.0  0.6  5:23.69 bash
  3842 root       20   0   13G  82M  39M S  0.0  0.5  0:00.78 node
  3910 root       20   0 10708 3988 2068 R  0.0  0.0  0:00.34 top
   F1Help  F2Menu  F3Search F4Filter F5Tree  F6SortBy F7Nice - F8Nice + F9Kill  F10Quit
@@ -331,7 +331,6 @@ No single tool combines all these features. Here's the landscape:
 | **Embeddable** | Yes (import as library) | No (standalone binary) | No (standalone server) | No (standalone binary) | No | No |
 | **Buffer parsing** | @xterm/headless (structured) | xterm.js (rendering) | xterm.js (rendering) | xterm.js (rendering) | Native terminal | Native terminal |
 | **Snapshot API** | JSON structured (visible/full/scrollback) | No | No | No | No | No |
-| **TUI screen parser** | Built-in (qodercli parser) | No | No | No | No | No |
 | **ANSI color export** | Cell-level reconstruction | Passthrough only | Passthrough only | Passthrough only | N/A | N/A |
 | **CLI flags** | `--serve`, `--connect`, `--snapshot`, `--color` | `--port`, `--interface` | `--port`, `--ssh` | `--port`, `--cred` | `-S`, `-t` | `--port` |
 | **Status** | Active | Active | Active | Abandoned | Active | Active |
@@ -343,7 +342,6 @@ No single tool combines all these features. Here's the landscape:
 3. **Multi-client broadcast** — one PTY, many WebSocket clients, all seeing and controlling the same session — tmux does this locally but not over HTTP/WebSocket
 4. **Embeddable library** — import `ptySpawn`, `ptySnapshot`, `ptySend` into any Node.js app — ttyd/Wetty are standalone binaries you can't embed
 5. **HTTP + WebSocket on same port** — REST polling endpoints alongside real-time streaming — no other tool offers both
-6. **TUI screen parser** — built-in parser that extracts structured messages from TUI apps (like qodercli's conversation) — unique
 
 ### When to use pty.ts
 

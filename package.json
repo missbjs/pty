@@ -1,27 +1,51 @@
 {
   "name": "pty",
   "version": "1.0.6",
-  "description": "",
-  "main": "index.js",
+  "description": "Generic PTY process manager — spawn TUI apps in a pseudo-terminal, capture buffer snapshots, broadcast over HTTP/WebSocket.",
+  "main": "./dist/pty.js",
+  "types": "./dist/pty.d.ts",
   "type": "module",
   "scripts": {
     "dev": "tsx pty.ts",
     "start": "node dist/pty.js",
-    "prebuild": "pnpm version patch --no-git-tag-version",
-    "build": "vite build",
-    "test": "vitest run pty.test.ts"
+    "build": "vite build && tsc --emitDeclarationOnly",
+    "pretest": "vite build",
+    "test": "vitest run"
   },
   "bin": {
     "pty": "./dist/pty.js"
   },
   "exports": {
     ".": {
+      "types": "./dist/pty.d.ts",
       "import": "./dist/pty.js"
     }
   },
-  "keywords": [],
-  "author": "",
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "keywords": [
+    "pty",
+    "tty",
+    "terminal",
+    "node-pty",
+    "xterm",
+    "headless",
+    "tui",
+    "websocket",
+    "snapshot"
+  ],
+  "author": "wongchichong <wongchichong@gmail.com>",
   "license": "ISC",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/missbjs/pty.git"
+  },
+  "bugs": {
+    "url": "https://github.com/missbjs/pty/issues"
+  },
+  "homepage": "https://github.com/missbjs/pty#readme",
   "packageManager": "pnpm@10.33.0",
   "approvedBuilds": [
     "node-pty"

@@ -54,183 +54,6 @@ export interface PtySpawnOptions {
   term?: string;
 }
 
-/** Extract the first fg color integer from a line that may contain ANSI codes */
-export function extractLineColor(line: string): number | null {
-  const match = /\x1b\[38;5;(\d+)m/.exec(line);
-  return match ? parseInt(match[1], 10) : null;
-}
-
-// ── Qodercli TUI Screen Parser ────────────────────────────────────────────
-
-/** Structured representation of the qodercli TUI screen */
-export interface QodercliScreen {
-  header: {
-    title: string;       // "Qoder CLI"
-    version: string;     // "0.1.44"
-    cwd: string;         // "/root/qoder-api"
-  } | null;
-  tips: string[];        // Tip lines
-  conversation: QoderMessage[];
-  inputBox: string;      // Text inside the input box
-  statusBar: string;     // Bottom status line (Model, MCP, cwd)
-  raw: string[];         // All non-empty lines for debugging
-}
-
-export interface QoderMessage {
-  type: "user" | "assistant" | "reasoning" | "system";
-  text: string;
-  /** Raw fg color integer from ANSI codes (app-specific interpretation belongs in the consumer) */
-  color?: number;
-}
-
-/**
- * Parse the qodercli TUI screen buffer into structured regions.
- *
- * Screen layout:
- *   Lines 0-4:   Header box (╭─╮ border)
- *   Line 6:      "Tips for getting started:"
- *   Lines 8-10:  Tips
- *   Line 12+:    Conversation ("> user", "● reasoning", text)
- *   Last few:    Input box (╭─╮ border), status bar
- */
-export function parseQodercliScreen(lines: string[], colorLines?: string[]): QodercliScreen {
-  const trimmed = lines.map(l => l.trimEnd());
-  const nonEmpty = trimmed.filter(l => l.length > 0);
-
-  // ── Header box ──────────────────────────────────────
-  let header: QodercliScreen["header"] = null;
-  const headerIdx = trimmed.findIndex(l => l.includes("Welcome to Qoder CLI"));
-  if (headerIdx !== -1) {
-    const titleLine = trimmed[headerIdx];
-    const titleMatch = titleLine.match(/Welcome to (.+?)!?(\s+\d+\.\d+\.\d+)/);
-    const cwdLine = trimmed.find(l => l.startsWith("cwd:"));
-
-    header = {
-      title: titleMatch?.[1] || "Qoder CLI",
-      version: titleMatch?.[2]?.trim() || "",
-      cwd: cwdLine?.replace("cwd: ", "").trim() || "",
-    };
-  }
-
-  // ── Tips ────────────────────────────────────────────
-  const tips: string[] = [];
-  const tipsHeaderIdx = trimmed.findIndex(l => l.includes("Tips for getting started"));
-  if (tipsHeaderIdx !== -1) {
-    for (let i = tipsHeaderIdx + 1; i < trimmed.length; i++) {
-      const t = trimmed[i].trim();
-      if (/^\d+\.\s/.test(t)) {
-        tips.push(t);
-      } else if (t.length === 0 || t.startsWith("╭") || t.startsWith(">")) {
-        break;
-      }
-    }
-  }
-
-  // ── Input box (bottom of screen) ────────────────────
-  let inputBox = "";
-  let statusBar = "";
-  // Find input box from bottom up
-  for (let i = trimmed.length - 1; i >= 0; i--) {
-    const t = trimmed[i].trim();
-    if (/^Model:/.test(t)) {
-      statusBar = t;
-      break;
-    }
-  }
-  // Find input box content
-  const inputBoxStart = trimmed.findIndex((l, idx) =>
-    idx > 0 && trimmed[idx - 1]?.includes("╭") && l.includes("│") && l.includes(">")
-  );
-  if (inputBoxStart !== -1) {
-    inputBox = trimmed[inputBoxStart].replace(/[│╭╮╰╯─]/g, "").trim().replace(/^>\s*/, "");
-  }
-
-  // ── Conversation ────────────────────────────────────
-  const conversation: QoderMessage[] = [];
-  // Find where conversation starts (after tips / header)
-  let convStart = -1;
-  for (let i = 0; i < trimmed.length; i++) {
-    const t = trimmed[i].trim();
-    if (t.startsWith("> ") && !t.includes("Type your message")) {
-      convStart = i;
-      break;
-    }
-  }
-  // Find where conversation ends (before input box)
-  let convEnd = trimmed.length;
-  for (let i = trimmed.length - 1; i >= 0; i--) {
-    if (trimmed[i].includes("╭") && trimmed[i].includes(">")) {
-      convEnd = i;
-      break;
-    }
-  }
-
-  if (convStart !== -1) {
-    let i = convStart;
-    while (i < convEnd) {
-      const t = trimmed[i].trim();
-      if (!t) { i++; continue; }
-
-      if (t.startsWith("> ")) {
-        const lineColor = colorLines ? extractLineColor(colorLines[i] || "") : undefined;
-        const textParts: string[] = [t.slice(2)];
-        i++;
-        while (i < convEnd && trimmed[i].trim() && !trimmed[i].startsWith("●") && !trimmed[i].startsWith("> ") && !trimmed[i].includes("╭")) {
-          textParts.push(trimmed[i].trim());
-          i++;
-        }
-        const msg: QoderMessage = { type: "user", text: textParts.join(" ").trim() };
-        if (lineColor != null) msg.color = lineColor;
-        conversation.push(msg);
-      } else if (t.startsWith("●")) {
-        // Could be reasoning or assistant answer — both use ● prefix
-        const lineColor = colorLines ? extractLineColor(colorLines[i] || "") : undefined;
-        const content = t.slice(1).trim();
-        const textParts: string[] = [content];
-        i++;
-        while (i < convEnd && trimmed[i].trim() && !trimmed[i].startsWith("●") && !trimmed[i].startsWith("> ") && !trimmed[i].includes("╭")) {
-          textParts.push(trimmed[i].trim());
-          i++;
-        }
-        const fullText = textParts.join(" ").trim();
-
-        // Reasoning patterns: self-talk, planning, tool descriptions (text heuristic fallback)
-        const isReasoning = /^(I should|I'll|This is|Let me|I need|First|Now I|I can|The user wants|I need to|I'll use|I should use|This appears|Looking at|Based on the|To |Let '|I can see|I don't have|I don't see)/i.test(fullText)
-          || /\b(tool|running|execute|use the|file|code)\b/i.test(fullText);
-
-        const msg: QoderMessage = {
-          type: isReasoning ? "reasoning" : "assistant",
-          text: fullText,
-        };
-        if (lineColor != null) msg.color = lineColor;
-        conversation.push(msg);
-      } else if (/^(qodercli is|Qoder CLI|This is|I|The |Let me|Based)/i.test(t)) {
-        const lineColor = colorLines ? extractLineColor(colorLines[i] || "") : undefined;
-        const textParts: string[] = [t];
-        i++;
-        while (i < convEnd && trimmed[i].trim() && !trimmed[i].startsWith("●") && !trimmed[i].startsWith("> ") && !trimmed[i].includes("╭") && !/^(Tips|Model:|Press enter|for shortcuts|ctrl\+j)/i.test(trimmed[i].trim())) {
-          textParts.push(trimmed[i].trim());
-          i++;
-        }
-        const msg: QoderMessage = { type: "assistant", text: textParts.join(" ").trim() };
-        if (lineColor != null) msg.color = lineColor;
-        conversation.push(msg);
-      } else {
-        i++;
-      }
-    }
-  }
-
-  return {
-    header,
-    tips,
-    conversation,
-    inputBox,
-    statusBar,
-    raw: nonEmpty,
-  };
-}
-
 // ── ANSI Color Reconstruction ──────────────────────────────────────────
 
 /**
@@ -276,7 +99,7 @@ function lineToAnsiString(line: any): string {
     result += "\x1b[0m";
   }
 
-  return line.translateToString(true).endsWith("\n") || line.isWrapped ? result : result;
+  return result;
 }
 
 // ── Service ────────────────────────────────────────────────────────────────
@@ -306,18 +129,24 @@ export function ptySpawn(opts: PtySpawnOptions): PtyInstance {
 
   const vt = new Terminal({ cols, rows, allowProposedApi: true, scrollback: 10000 });
 
-  // Feed PTY output into xterm buffer and respond to terminal probes
+  // Feed PTY output into xterm buffer and respond to terminal probes.
+  // outputAccum is bounded — only used to detect early-exit "command not found"
+  // errors (the threshold check on exit is < 500 bytes), so stop accumulating
+  // past a small cap to avoid unbounded growth on long-running PTYs.
+  const ACCUM_CAP = 2048;
   let outputAccum = "";
   ptyProcess.onData((data) => {
-    outputAccum += data;
+    if (outputAccum.length < ACCUM_CAP) {
+      outputAccum += data;
+      if (outputAccum.length > ACCUM_CAP) outputAccum = outputAccum.slice(0, ACCUM_CAP);
+    }
     vt.write(data);
 
     // Respond to terminal probe sequences so TUI apps render properly:
     // \x1b[6n = Cursor Position Request → respond with \x1b[1;1R
-    // \x1b]11;?\x1b\\ = OSC 11 background color query → ignore (no response needed)
+    // The trailing-\x1b[ check covers chunk boundaries that split the CPR
+    // sequence — many TUIs hang waiting for the reply if it's missed.
     if (data.includes("\x1b[6n") || data.endsWith("\x1b[")) {
-      // CPR: qodercli and other TUIs probe cursor position before rendering
-      // Respond with row=1, col=1 — the terminal hasn't moved yet
       setTimeout(() => ptyProcess.write("\x1b[1;1R"), 50);
     }
   });
@@ -715,7 +544,6 @@ Examples:
             return res.end(JSON.stringify({
               visibleText: snap.visibleText,
               visibleLines: snap.visibleLines,
-              screen: parseQodercliScreen(snap.visibleLines),
               cols: instance.cols,
               rows: instance.rows,
               pid: instance.process.pid,
@@ -730,14 +558,13 @@ Examples:
             return res.end(JSON.stringify({
               visibleText: snap.visibleText,
               visibleLines: snap.visibleLines,
-              screen: parseQodercliScreen(snap.visibleLines),
             }));
           }
 
           // GET /snapshot/full
           if (req.method === "GET" && pathname === "/snapshot/full") {
             const withColor = url.searchParams.get("color") === "true";
-            const snap = ptySnapshot(instance, 20, true); // always stripped for text logic
+            const snap = ptySnapshot(instance, 20, true);
             const payload: Record<string, unknown> = {
               fullText: snap.fullText,
               fullLines: snap.fullLines,
@@ -754,20 +581,9 @@ Examples:
               const colorSnap = ptySnapshot(instance, 20, false);
               payload.fullLinesColor = colorSnap.fullLines;
               payload.visibleLinesColor = colorSnap.visibleLines;
-              // Parse with color lines so messages carry the color field
-              payload.screen = parseQodercliScreen(snap.fullLines, colorSnap.fullLines);
-            } else {
-              payload.screen = parseQodercliScreen(snap.fullLines);
             }
             res.writeHead(200, { "Content-Type": "application/json" });
             return res.end(JSON.stringify(payload));
-          }
-
-          // GET /screen — structured qodercli screen parse
-          if (req.method === "GET" && pathname === "/screen") {
-            const snap = ptySnapshot(instance);
-            res.writeHead(200, { "Content-Type": "application/json" });
-            return res.end(JSON.stringify(parseQodercliScreen(snap.visibleLines)));
           }
 
           // POST /send
@@ -974,7 +790,6 @@ Examples:
     await new Promise((r) => setTimeout(r, waitMs));
 
     const snap = ptySnapshot(instance, 20, !color);
-    const screen = parseQodercliScreen(snap.visibleLines);
 
     console.log("=== VISIBLE SCREEN ===");
     console.log(snap.visibleText);
@@ -982,27 +797,6 @@ Examples:
     console.log(snap.scrollbackLines.join("\n"));
     console.log("=== END ===");
     console.log(`Buffer: ${snap.bufLength} lines, scroll: ${snap.baseY}`);
-
-    // Show parsed qodercli screen if detected
-    if (screen.header || screen.conversation.length > 0) {
-      console.log("\n=== PARSED SCREEN ===");
-      if (screen.header) {
-        console.log(`Header: ${screen.header.title} ${screen.header.version}`);
-        console.log(`CWD:    ${screen.header.cwd}`);
-      }
-      if (screen.tips.length > 0) {
-        console.log(`Tips:   ${screen.tips.length} tip(s)`);
-      }
-      if (screen.conversation.length > 0) {
-        console.log(`Conversation (${screen.conversation.length} message(s)): `);
-        for (const msg of screen.conversation) {
-          console.log(`  [${msg.type}] ${msg.text.slice(0, 120)}${msg.text.length > 120 ? "..." : ""}`);
-        }
-      }
-      if (screen.statusBar) {
-        console.log(`Status: ${screen.statusBar}`);
-      }
-    }
 
     ptyKill(instance);
     process.exit(0);
