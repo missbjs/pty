@@ -14,11 +14,16 @@ const Terminal = (xtermHeadless as any).Terminal;
 
 export interface PtyInstance {
   id: string;
+  name: string; // human-readable name (command)
+  command: string;
+  args: string[];
   process: pty.IPty;
   terminal: any; // xterm headless terminal
   cols: number;
   rows: number;
+  cwd: string;
   createdAt: number;
+  clients: Set<WsClient>; // connected WebSocket clients
 }
 
 export interface BufferSnapshot {
@@ -105,6 +110,7 @@ function lineToAnsiString(line: any): string {
 // ── Service ────────────────────────────────────────────────────────────────
 
 const instances = new Map<string, PtyInstance>();
+let defaultInstance: PtyInstance | null = null; // for backward compat with single-app mode
 
 /** Spawn a new process in a PTY and return the instance */
 export function ptySpawn(opts: PtySpawnOptions): PtyInstance {
@@ -113,6 +119,7 @@ export function ptySpawn(opts: PtySpawnOptions): PtyInstance {
   const cols = opts.cols ?? 400; // wide default to avoid line wrapping
   const rows = opts.rows ?? 40;
   const term = opts.term ?? "xterm-256color";
+  const cwd = opts.cwd ?? process.cwd();
 
   let ptyProcess: pty.IPty;
   try {
@@ -120,7 +127,7 @@ export function ptySpawn(opts: PtySpawnOptions): PtyInstance {
       name: term,
       cols,
       rows,
-      cwd: opts.cwd ?? process.cwd(),
+      cwd,
       env: { ...process.env, COLORTERM: "truecolor", TERM: term, ...(opts.env ?? {}) },
     });
   } catch (err: any) {
@@ -153,17 +160,31 @@ export function ptySpawn(opts: PtySpawnOptions): PtyInstance {
 
   const instance: PtyInstance = {
     id,
+    name: opts.command,
+    command: opts.command,
+    args: opts.args ?? [],
     process: ptyProcess,
     terminal: vt,
     cols,
     rows,
+    cwd,
     createdAt: Date.now(),
+    clients: new Set(),
   };
 
   instances.set(id, instance);
 
   ptyProcess.onExit(({ exitCode }) => {
-    setTimeout(() => instances.delete(id), 5000);
+    // Notify connected clients
+    for (const client of instance.clients) {
+      if (client.readyState === WsClient.OPEN) {
+        client.send(JSON.stringify({ type: "exit", exitCode, id }));
+        client.close();
+      }
+    }
+    instance.clients.clear();
+    instances.delete(id);
+    
     if (exitCode !== 0 && outputAccum.trim().length < 500) {
       const clean = outputAccum.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, "").replace(/\x1b\][^\x07]*\x07/g, "").trim();
       if (clean.includes("No such file") || clean.includes("not found") || clean.includes("execvp")) {
@@ -242,7 +263,8 @@ export function ptyResize(instance: PtyInstance, cols: number, rows: number): vo
 /** Kill the PTY process */
 export function ptyKill(instance: PtyInstance): void {
   try { instance.process.kill(); } catch {}
-  instances.delete(instance.id);
+  // Don't clear clients here - let onExit handler notify them first
+  // instances.delete will happen in onExit handler after notification
 }
 
 /** Get a PTY instance by ID */
@@ -253,6 +275,16 @@ export function ptyGet(id: string): PtyInstance | undefined {
 /** List all active PTY instances */
 export function ptyList(): PtyInstance[] {
   return [...instances.values()];
+}
+
+/** Get the first/default instance */
+export function ptyDefault(): PtyInstance | undefined {
+  return defaultInstance ?? instances.values().next().value;
+}
+
+/** Set the default instance */
+export function ptySetDefault(instance: PtyInstance | null): void {
+  defaultInstance = instance;
 }
 
 /** Cleanup all PTY instances */
@@ -281,58 +313,58 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   (async () => {
     const args = process.argv.slice(2);
     if (args.length === 0 || args[0] === "--help" || args[0] === "-h") {
-      console.log(`Usage: tsx pty.ts <command> [args...] [-- <pty-options>]
+      console.log(`Usage: tsx pty.ts [command] [args...] [-- <options>]
 
-Spawn a TUI app in a PTY and interact with it.
+PTY Service Manager — spawn, manage, and interact with TUI applications.
 
-Commands:
-  <command> [args...]    Command to run (everything before --)
+Server mode:
+  --serve                    Start PTY service manager (HTTP + WebSocket)
+  --port <n>                 Server port (default: 3000)
+  --host <addr>              Bind address (default: 127.0.0.1)
+
+Client commands (requires running server):
+  --start <cmd> [args...]    Spawn a new TUI application
+  --list                     List all running applications
+  --kill <id>                Kill an application by ID (sends SIGTERM)
+  --connect [id]             Connect to an app interactively (default: first)
+
+Direct mode (no server):
+  <command> [args...]        Run command directly in PTY
 
 PTY options (after --):
-  --cols <n>             Terminal width (default: auto from TTY, fallback 400)
-  --rows <n>             Terminal height (default: auto from TTY, fallback 40)
-  --cwd <dir>            Working directory (default: current)
-  --term <name>          Terminal type (default: xterm-256color)
-  --wait <ms>            Wait time before first snapshot (default: 1000)
-  --color                Preserve ANSI color codes in snapshot output
-  --interactive          Relay TUI to current terminal (default when not --serve)
-  --snapshot             Print buffer snapshot once and exit
-  --serve                Start HTTP + WebSocket server
-  --connect              Connect to an existing PTY server (no command needed)
-  --port <n>             Server port for --serve / --connect (default: 3000)
-  --host <addr>          Bind address for --serve (default: 127.0.0.1)
-
-Modes (mutually exclusive):
-  (none)                 Interactive passthrough to current terminal
-  --interactive          Same as above, explicit
-  --snapshot             Single snapshot and exit
-  --serve                HTTP API + WebSocket server (spawn app + broadcast)
-  --connect              WebSocket client to existing --serve instance
+  --cols <n>                 Terminal width (default: 400)
+  --rows <n>                 Terminal height (default: 40)
+  --cwd <dir>                Working directory
+  --term <name>              Terminal type (default: xterm-256color)
+  --wait <ms>                Wait before snapshot (default: 1000)
+  --color                    Preserve ANSI color codes
+  --interactive              Interactive passthrough (default)
+  --snapshot                 Print snapshot and exit
 
 HTTP API (--serve mode):
-  GET  /snapshot          Get current screen snapshot
-  GET  /snapshot?color=true  Snapshot with ANSI color codes
-  GET  /snapshot/visible  Get visible area only
-  GET  /snapshot/visible?color=true  Visible area with ANSI color codes
-  GET  /snapshot/full     Get full buffer with scrollback
-  GET  /snapshot/full?color=true  Full buffer with ANSI color codes
-  POST /send              Send keystrokes to PTY { "text": "..." }
-  POST /resize            Resize PTY { "cols": 120, "rows": 30 }
-  GET  /status            Get PTY process status
-  GET  /health            Health check
+  GET  /apps                 List all running apps
+  POST /start                Spawn new app { "command": "...", "args": [] }
+  POST /kill                 Kill app { "id": "..." }
+  GET  /app/:id/snapshot     Get app snapshot
+  POST /app/:id/send         Send keystrokes { "text": "..." }
+  POST /app/:id/resize       Resize app { "cols": N, "rows": N }
+  GET  /app/:id/status       Get app status
+  GET  /health               Health check
+  WS   /app/:id              WebSocket for real-time I/O
 
 Examples:
-  pnpm dev top
-  pnpm dev top -- --interactive
-  pnpm dev htop -- --serve --host 0.0.0.0 --port 8080
-  pnpm dev vim file.txt -- --cols 120 --rows 30 --snapshot
-  pnpm dev top -- --serve --port 3000       # spawn top + serve
-  pnpm dev -- --connect --port 3000         # connect to existing server`);
+  pnpm dev -- --serve --port 3000           # start service manager
+  pnpm dev -- --start htop                  # spawn htop
+  pnpm dev -- --list                        # list running apps
+  pnpm dev -- --kill abc123                 # kill app by ID
+  pnpm dev -- --connect abc123              # connect to specific app
+  pnpm dev -- --connect                     # connect to first app
+  pnpm dev htop                             # run htop directly (no server)`);
       process.exit(0);
     }
 
     // Split args at -- : left = command+args, right = pty options
-    const PTY_FLAGS = new Set(["--cols", "--rows", "--cwd", "--term", "--wait", "--color", "--interactive", "--snapshot", "--serve", "--connect", "--port", "--host"]);
+    const PTY_FLAGS = new Set(["--cols", "--rows", "--cwd", "--term", "--wait", "--color", "--interactive", "--snapshot", "--serve", "--connect", "--port", "--host", "--start", "--list", "--kill"]);
 
     let cmdArgs: string[];
     let ptyOpts: string[];
@@ -341,7 +373,7 @@ Examples:
     if (explicitSplit !== -1) {
       cmdArgs = args.slice(0, explicitSplit);
       ptyOpts = [];
-      const valueFlags = new Set(["--cols", "--rows", "--cwd", "--term", "--wait", "--port", "--host"]);
+      const valueFlags = new Set(["--cols", "--rows", "--cwd", "--term", "--wait", "--port", "--host", "--start", "--kill"]);
       for (let i = explicitSplit + 1; i < args.length; i++) {
         const arg = args[i];
         if (PTY_FLAGS.has(arg)) {
@@ -392,6 +424,9 @@ Examples:
     let connect = false;
     let port = 3000;
     let host = "127.0.0.1";
+    let start: string | undefined;
+    let list = false;
+    let kill: string | undefined;
 
     for (let i = 0; i < ptyOpts.length; i++) {
       switch (ptyOpts[i]) {
@@ -407,6 +442,9 @@ Examples:
         case "--connect": connect = true; break;
         case "--port": port = parseInt(ptyOpts[++i], 10); break;
         case "--host": host = ptyOpts[++i]; break;
+        case "--start": start = ptyOpts[++i]; break;
+        case "--list": list = true; break;
+        case "--kill": kill = ptyOpts[++i]; break;
       }
     }
 
@@ -431,99 +469,181 @@ Examples:
       interactive = true;
     }
 
-    // ── Connect mode (WebSocket client) ────────────────────────────────
-    if (connect) {
-      const resolvedCols = cols ?? (process.stdout.isTTY ? process.stdout.columns : undefined);
-      const resolvedRows = rows ?? (process.stdout.isTTY ? process.stdout.rows : undefined);
-
-      // Set up stdin first
-      if (process.stdin.isTTY) process.stdin.setRawMode(true);
-      process.stdin.resume();
-
-      const ws = new WsClient(`ws://${host}:${port}`);
-
-      // Stdin → WebSocket (set up early, before connection)
-      process.stdin.on("data", (data) => {
-        const key = data.toString();
-        if (key === "\x03") {
-          if (process.stdin.isTTY) process.stdin.setRawMode(false);
-          ws.close();
-          process.exit(0);
-          return;
-        }
-        if (ws.readyState === WsClient.OPEN) {
-          ws.send(JSON.stringify({ type: "input", text: key }));
-        }
-      });
-
-      ws.on("open", () => {
-        // Tell server our terminal dimensions
-        if (resolvedCols && resolvedRows) {
-          ws.send(JSON.stringify({ type: "resize", cols: resolvedCols, rows: resolvedRows }));
-        }
-        process.stderr.write(`Connected to PTY server at ws://${host}:${port}\n`);
-        process.stderr.write(`Mode: remote interactive (Ctrl+C to disconnect)\n\n`);
-      });
-
-      ws.on("message", (data) => {
-        const msg = JSON.parse(data.toString());
-        if (msg.type === "output") {
-          process.stdout.write(msg.text);
-        } else if (msg.type === "exit") {
-          if (process.stdin.isTTY) process.stdin.setRawMode(false);
-          process.stderr.write(`\n\nRemote process exited with code ${msg.exitCode}\n`);
-          process.exit(0);
-        } else if (msg.type === "ready") {
-          // Server acknowledges connection
-        }
-      });
-
-      ws.on("close", () => {
-        if (process.stdin.isTTY) process.stdin.setRawMode(false);
-        process.stderr.write("\nDisconnected from PTY server\n");
-        process.exit(0);
-      });
-
-      ws.on("error", (err) => {
-        process.stderr.write(`Connection error: ${err.message}\n`);
-        if (process.stdin.isTTY) process.stdin.setRawMode(false);
-        process.exit(1);
-      });
-
-      // Handle resize → send to server
-      if (process.stdout.isTTY) {
-        process.stdout.on("resize", () => {
-          if (ws.readyState === WsClient.OPEN) {
-            ws.send(JSON.stringify({
-              type: "resize",
-              cols: process.stdout.columns,
-              rows: process.stdout.rows,
-            }));
-          }
+    // ── Client commands (require running server) ─────────────────────────────
+    if (start || list || kill || connect) {
+      const baseUrl = `http://${host}:${port}`;
+      
+      // Helper for HTTP requests
+      const httpGet = async (path: string) => {
+        const res = await fetch(`${baseUrl}${path}`);
+        return res.json();
+      };
+      const httpPost = async (path: string, body: object) => {
+        const res = await fetch(`${baseUrl}${path}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
         });
+        return res.json();
+      };
+
+      // --list: List all running apps
+      if (list) {
+        try {
+          const result = await httpGet("/apps") as { apps: Array<{ id: string; name: string; pid: number; cols: number; rows: number; createdAt: number }> };
+          if (result.apps.length === 0) {
+            console.log("No running applications.");
+          } else {
+            console.log("Running applications:");
+            for (const app of result.apps) {
+              const age = Math.round((Date.now() - app.createdAt) / 1000);
+              console.log(`  ${app.id.slice(0, 8)}  ${app.name.padEnd(20)}  pid:${app.pid}  ${app.cols}x${app.rows}  ${age}s`);
+            }
+          }
+        } catch (err: any) {
+          console.error(`Failed to connect to server: ${err.message}`);
+          process.exit(1);
+        }
+        return;
       }
 
-      return;
+      // --start: Spawn a new app
+      if (start) {
+        try {
+          const result = await httpPost("/start", { command: start, args: cmdRest, cols, rows, cwd, term }) as { id: string; pid: number } | { error: string };
+          if ("error" in result) {
+            console.error(`Error: ${result.error}`);
+            process.exit(1);
+          }
+          console.log(`Started app: ${result.id.slice(0, 8)} (pid: ${result.pid})`);
+          console.log(`Connect: pnpm dev -- --connect ${result.id.slice(0, 8)}`);
+        } catch (err: any) {
+          console.error(`Failed to start app: ${err.message}`);
+          process.exit(1);
+        }
+        return;
+      }
+
+      // --kill: Kill an app
+      if (kill) {
+        try {
+          const result = await httpPost("/kill", { id: kill }) as { ok: boolean } | { error: string };
+          if ("error" in result) {
+            console.error(`Error: ${result.error}`);
+            process.exit(1);
+          }
+          console.log(`Killed app: ${kill}`);
+        } catch (err: any) {
+          console.error(`Failed to kill app: ${err.message}`);
+          process.exit(1);
+        }
+        return;
+      }
+
+      // --connect: Interactive connection to an app
+      if (connect) {
+        const resolvedCols = cols ?? (process.stdout.isTTY ? process.stdout.columns : undefined);
+        const resolvedRows = rows ?? (process.stdout.isTTY ? process.stdout.rows : undefined);
+
+        // Determine which app to connect to
+        let appId = command; // command arg after --connect becomes the app ID
+        if (!appId) {
+          // Get first available app
+          try {
+            const result = await httpGet("/apps") as { apps: Array<{ id: string }> };
+            if (result.apps.length === 0) {
+              console.error("No running applications. Use --start to spawn one.");
+              process.exit(1);
+            }
+            appId = result.apps[0].id;
+            console.error(`Connecting to app: ${appId.slice(0, 8)}`);
+          } catch (err: any) {
+            console.error(`Failed to connect to server: ${err.message}`);
+            process.exit(1);
+          }
+        }
+
+        // Set up stdin first
+        if (process.stdin.isTTY) process.stdin.setRawMode(true);
+        process.stdin.resume();
+
+        const ws = new WsClient(`ws://${host}:${port}/app/${appId}`);
+
+        // Stdin → WebSocket (set up early, before connection)
+        process.stdin.on("data", (data) => {
+          const key = data.toString();
+          if (key === "\x03") {
+            if (process.stdin.isTTY) process.stdin.setRawMode(false);
+            ws.close();
+            process.exit(0);
+            return;
+          }
+          if (ws.readyState === WsClient.OPEN) {
+            ws.send(JSON.stringify({ type: "input", text: key }));
+          }
+        });
+
+        ws.on("open", () => {
+          // Tell server our terminal dimensions
+          if (resolvedCols && resolvedRows) {
+            ws.send(JSON.stringify({ type: "resize", cols: resolvedCols, rows: resolvedRows }));
+          }
+          process.stderr.write(`Connected to app ${appId!.slice(0, 8)} at ws://${host}:${port}\n`);
+          process.stderr.write(`Mode: remote interactive (Ctrl+C to disconnect)\n\n`);
+        });
+
+        ws.on("message", (data) => {
+          const msg = JSON.parse(data.toString());
+          if (msg.type === "output") {
+            process.stdout.write(msg.text);
+          } else if (msg.type === "exit") {
+            if (process.stdin.isTTY) process.stdin.setRawMode(false);
+            process.stderr.write(`\n\nRemote process exited with code ${msg.exitCode}\n`);
+            process.exit(0);
+          } else if (msg.type === "ready") {
+            // Server acknowledges connection
+          }
+        });
+
+        ws.on("close", () => {
+          if (process.stdin.isTTY) process.stdin.setRawMode(false);
+          process.stderr.write("\nDisconnected from PTY server\n");
+          process.exit(0);
+        });
+
+        ws.on("error", (err) => {
+          process.stderr.write(`Connection error: ${err.message}\n`);
+          if (process.stdin.isTTY) process.stdin.setRawMode(false);
+          process.exit(1);
+        });
+
+        // Handle resize → send to server
+        if (process.stdout.isTTY) {
+          process.stdout.on("resize", () => {
+            if (ws.readyState === WsClient.OPEN) {
+              ws.send(JSON.stringify({
+                type: "resize",
+                cols: process.stdout.columns,
+                rows: process.stdout.rows,
+              }));
+            }
+          });
+        }
+
+        return;
+      }
     }
 
-    console.log(`Spawning: ${command} ${cmdRest.join(" ")}`);
-    console.log(`  Terminal: ${resolvedCols}x${resolvedRows}, cwd: ${cwd}, term: ${term}`);
-    if (serve) console.log(`  Mode: serve on http://${host}:${port}`);
-    else if (snapshot) console.log(`  Mode: snapshot (wait ${waitMs}ms)`);
-    else console.log(`  Mode: interactive (Ctrl+C to exit)`);
-    console.log();
-
-    let instance: ReturnType<typeof ptySpawn>;
-    try {
-      instance = ptySpawn({ command, args: cmdRest, cols: resolvedCols, rows: resolvedRows, cwd, term });
-    } catch (err: any) {
-      console.error(err.message);
-      process.exit(1);
-    }
-
-    // ── Serve mode ─────────────────────────────────────────────────────
+    // ── Serve mode (multi-app service manager) ───────────────────────────
     if (serve) {
       const { createServer } = await import("http");
+
+      // If a command was provided, spawn it as the initial app
+      if (command) {
+        console.log(`Initial app: ${command} ${cmdRest.join(" ")}`);
+      }
+      console.log(`Service manager starting on http://${host}:${port}`);
+      console.log();
 
       const server = createServer(async (req, res) => {
         const url = new URL(req.url!, `http://${host}:${port}`);
@@ -535,112 +655,162 @@ Examples:
         res.setHeader("Access-Control-Allow-Headers", "Content-Type");
         if (req.method === "OPTIONS") { res.writeHead(204); return res.end(); }
 
+        // Helper to read request body
+        const readBody = (): Promise<string> => new Promise((resolve) => {
+          let body = "";
+          req.on("data", (chunk) => (body += chunk));
+          req.on("end", () => resolve(body));
+        });
+
+        // Helper to find app by ID (supports short IDs)
+        const findApp = (id: string): PtyInstance | undefined => {
+          // Try exact match first
+          let app = instances.get(id);
+          if (app) return app;
+          // Try short ID match (first 8 chars)
+          for (const [fullId, inst] of instances) {
+            if (fullId.startsWith(id)) return inst;
+          }
+          return undefined;
+        };
+
         try {
-          // GET /snapshot — visible area
-          if (req.method === "GET" && pathname === "/snapshot") {
-            const color = url.searchParams.get("color") === "true";
-            const snap = ptySnapshot(instance, 20, !color);
-            res.writeHead(200, { "Content-Type": "application/json" });
-            return res.end(JSON.stringify({
-              visibleText: snap.visibleText,
-              visibleLines: snap.visibleLines,
-              cols: instance.cols,
-              rows: instance.rows,
-              pid: instance.process.pid,
+          // GET /apps - list all running apps
+          if (req.method === "GET" && pathname === "/apps") {
+            const apps = ptyList().map(inst => ({
+              id: inst.id,
+              name: inst.name,
+              pid: inst.process.pid,
+              cols: inst.cols,
+              rows: inst.rows,
+              cwd: inst.cwd,
+              createdAt: inst.createdAt,
+              clients: inst.clients.size,
             }));
+            res.writeHead(200, { "Content-Type": "application/json" });
+            return res.end(JSON.stringify({ apps }));
           }
 
-          // GET /snapshot/visible
-          if (req.method === "GET" && pathname === "/snapshot/visible") {
-            const color = url.searchParams.get("color") === "true";
-            const snap = ptySnapshot(instance, 20, !color);
-            res.writeHead(200, { "Content-Type": "application/json" });
-            return res.end(JSON.stringify({
-              visibleText: snap.visibleText,
-              visibleLines: snap.visibleLines,
-            }));
-          }
-
-          // GET /snapshot/full
-          if (req.method === "GET" && pathname === "/snapshot/full") {
-            const withColor = url.searchParams.get("color") === "true";
-            const snap = ptySnapshot(instance, 20, true);
-            const payload: Record<string, unknown> = {
-              fullText: snap.fullText,
-              fullLines: snap.fullLines,
-              visibleLines: snap.visibleLines,
-              scrollbackLines: snap.scrollbackLines,
-              visibleText: snap.visibleText,
-              footerText: snap.footerText,
-              cols: instance.cols,
-              rows: instance.rows,
-              baseY: snap.baseY,
-              bufLength: snap.bufLength,
-            };
-            if (withColor) {
-              const colorSnap = ptySnapshot(instance, 20, false);
-              payload.fullLinesColor = colorSnap.fullLines;
-              payload.visibleLinesColor = colorSnap.visibleLines;
+          // POST /start - spawn a new app
+          if (req.method === "POST" && pathname === "/start") {
+            const body = await readBody();
+            const { command: cmd, args = [], cols: c, rows: r, cwd: wd, term: t } = JSON.parse(body);
+            if (!cmd) {
+              res.writeHead(400, { "Content-Type": "application/json" });
+              return res.end(JSON.stringify({ error: "command is required" }));
             }
+            try {
+              const inst = ptySpawn({
+                command: cmd,
+                args,
+                cols: c ?? 400,
+                rows: r ?? 40,
+                cwd: wd ?? process.cwd(),
+                term: t ?? "xterm-256color",
+              });
+              console.log(`Started: ${cmd} (id: ${inst.id.slice(0, 8)}, pid: ${inst.process.pid})`);
+              res.writeHead(200, { "Content-Type": "application/json" });
+              return res.end(JSON.stringify({ id: inst.id, pid: inst.process.pid }));
+            } catch (err: any) {
+              res.writeHead(400, { "Content-Type": "application/json" });
+              return res.end(JSON.stringify({ error: err.message }));
+            }
+          }
+
+          // POST /kill - kill an app
+          if (req.method === "POST" && pathname === "/kill") {
+            const body = await readBody();
+            const { id } = JSON.parse(body);
+            if (!id) {
+              res.writeHead(400, { "Content-Type": "application/json" });
+              return res.end(JSON.stringify({ error: "id is required" }));
+            }
+            const app = findApp(id);
+            if (!app) {
+              res.writeHead(404, { "Content-Type": "application/json" });
+              return res.end(JSON.stringify({ error: "app not found" }));
+            }
+            console.log(`Killed: ${app.name} (id: ${app.id.slice(0, 8)})`);
+            ptyKill(app);
             res.writeHead(200, { "Content-Type": "application/json" });
-            return res.end(JSON.stringify(payload));
-          }
-
-          // POST /send
-          if (req.method === "POST" && pathname === "/send") {
-            let body = "";
-            req.on("data", (chunk) => (body += chunk));
-            req.on("end", () => {
-              try {
-                const { text } = JSON.parse(body);
-                if (!text) throw new Error("text is required");
-                ptySend(instance, text);
-                res.writeHead(200, { "Content-Type": "application/json" });
-                res.end(JSON.stringify({ ok: true }));
-              } catch (err: any) {
-                res.writeHead(400, { "Content-Type": "application/json" });
-                res.end(JSON.stringify({ error: err.message }));
-              }
-            });
-            return;
-          }
-
-          // POST /resize
-          if (req.method === "POST" && pathname === "/resize") {
-            let body = "";
-            req.on("data", (chunk) => (body += chunk));
-            req.on("end", () => {
-              try {
-                const { cols: c, rows: r } = JSON.parse(body);
-                if (!c || !r) throw new Error("cols and rows are required");
-                ptyResize(instance, c, r);
-                res.writeHead(200, { "Content-Type": "application/json" });
-                res.end(JSON.stringify({ ok: true, cols: c, rows: r }));
-              } catch (err: any) {
-                res.writeHead(400, { "Content-Type": "application/json" });
-                res.end(JSON.stringify({ error: err.message }));
-              }
-            });
-            return;
-          }
-
-          // GET /status
-          if (req.method === "GET" && pathname === "/status") {
-            res.writeHead(200, { "Content-Type": "application/json" });
-            return res.end(JSON.stringify({
-              pid: instance.process.pid,
-              cols: instance.cols,
-              rows: instance.rows,
-              cwd: instance.cols > 0 ? cwd : undefined,
-              createdAt: instance.createdAt,
-              running: true,
-            }));
+            return res.end(JSON.stringify({ ok: true }));
           }
 
           // GET /health
           if (req.method === "GET" && pathname === "/health") {
             res.writeHead(200, { "Content-Type": "application/json" });
-            return res.end(JSON.stringify({ status: "ok", pid: instance.process.pid }));
+            return res.end(JSON.stringify({ status: "ok", apps: instances.size }));
+          }
+
+          // App-specific endpoints: /app/:id/...
+          const appMatch = pathname.match(/^\/app\/([^/]+)(\/.*)?$/);
+          if (appMatch) {
+            const appId = appMatch[1];
+            const subPath = appMatch[2] || "/";
+            const app = findApp(appId);
+            
+            if (!app) {
+              res.writeHead(404, { "Content-Type": "application/json" });
+              return res.end(JSON.stringify({ error: "app not found" }));
+            }
+
+            // GET /app/:id/snapshot
+            if (req.method === "GET" && subPath === "/snapshot") {
+              const color = url.searchParams.get("color") === "true";
+              const snap = ptySnapshot(app, 20, !color);
+              res.writeHead(200, { "Content-Type": "application/json" });
+              return res.end(JSON.stringify({
+                visibleText: snap.visibleText,
+                visibleLines: snap.visibleLines,
+                cols: app.cols,
+                rows: app.rows,
+                pid: app.process.pid,
+              }));
+            }
+
+            // GET /app/:id/status
+            if (req.method === "GET" && subPath === "/status") {
+              res.writeHead(200, { "Content-Type": "application/json" });
+              return res.end(JSON.stringify({
+                id: app.id,
+                name: app.name,
+                pid: app.process.pid,
+                cols: app.cols,
+                rows: app.rows,
+                cwd: app.cwd,
+                createdAt: app.createdAt,
+                clients: app.clients.size,
+              }));
+            }
+
+            // POST /app/:id/send
+            if (req.method === "POST" && subPath === "/send") {
+              const body = await readBody();
+              const { text } = JSON.parse(body);
+              if (!text) {
+                res.writeHead(400, { "Content-Type": "application/json" });
+                return res.end(JSON.stringify({ error: "text is required" }));
+              }
+              ptySend(app, text);
+              res.writeHead(200, { "Content-Type": "application/json" });
+              return res.end(JSON.stringify({ ok: true }));
+            }
+
+            // POST /app/:id/resize
+            if (req.method === "POST" && subPath === "/resize") {
+              const body = await readBody();
+              const { cols: c, rows: r } = JSON.parse(body);
+              if (!c || !r) {
+                res.writeHead(400, { "Content-Type": "application/json" });
+                return res.end(JSON.stringify({ error: "cols and rows are required" }));
+              }
+              ptyResize(app, c, r);
+              res.writeHead(200, { "Content-Type": "application/json" });
+              return res.end(JSON.stringify({ ok: true, cols: c, rows: r }));
+            }
+
+            res.writeHead(404, { "Content-Type": "application/json" });
+            return res.end(JSON.stringify({ error: "unknown app endpoint" }));
           }
 
           // 404
@@ -652,101 +822,144 @@ Examples:
         }
       });
 
-      // Handle process exit
-      instance.process.onExit(({ exitCode }) => {
-        console.log(`\nPTY process exited with code ${exitCode}`);
-        server.close();
-        process.exit(exitCode ?? 0);
-      });
+      // Spawn initial app if command provided
+      if (command) {
+        try {
+          const inst = ptySpawn({ command, args: cmdRest, cols: resolvedCols, rows: resolvedRows, cwd, term });
+          ptySetDefault(inst);
+          console.log(`Started: ${command} (id: ${inst.id.slice(0, 8)}, pid: ${inst.process.pid})`);
+        } catch (err: any) {
+          console.error(err.message);
+          process.exit(1);
+        }
+      }
 
       server.listen(port, host, () => {
-        console.log(`PTY server listening on http://${host}:${port}`);
+        console.log(`PTY service manager listening on http://${host}:${port}`);
         console.log(`Endpoints:`);
-        console.log(`  GET  /snapshot          — visible screen`);
-        console.log(`  GET  /snapshot?color=true — visible screen with ANSI color`);
-        console.log(`  GET  /snapshot/visible  — visible area`);
-        console.log(`  GET  /snapshot/visible?color=true — visible area with ANSI color`);
-        console.log(`  GET  /snapshot/full     — full buffer + scrollback`);
-        console.log(`  GET  /snapshot/full?color=true — full buffer with ANSI color`);
-        console.log(`  POST /send              — send keystrokes { "text": "..." }`);
-        console.log(`  POST /resize            — resize PTY { "cols": N, "rows": N }`);
-        console.log(`  GET  /status            — process status`);
+        console.log(`  GET  /apps              — list all running apps`);
+        console.log(`  POST /start             — spawn new app { "command": "..." }`);
+        console.log(`  POST /kill              — kill app { "id": "..." }`);
+        console.log(`  GET  /app/:id/snapshot  — get app snapshot`);
+        console.log(`  POST /app/:id/send      — send keystrokes`);
+        console.log(`  POST /app/:id/resize    — resize app`);
+        console.log(`  GET  /app/:id/status    — get app status`);
         console.log(`  GET  /health            — health check`);
-        console.log(`  WS   ws://${host}:${port}           — WebSocket for real-time I/O`);
+        console.log(`  WS   ws://${host}:${port}/app/:id  — WebSocket for real-time I/O`);
         console.log(`\nCtrl+C to stop`);
       });
 
-      // ── WebSocket server for real-time multi-client ──────────────────
+      // ── WebSocket server for per-app real-time I/O ─────────────────────
       const wss = new WebSocketServer({ server });
-      const clients = new Set<WsClient>();
 
-      // Broadcast PTY output to all connected clients
-      instance.process.onData((data) => {
-        const payload = JSON.stringify({ type: "output", text: data });
-        for (const client of clients) {
-          if (client.readyState === WsClient.OPEN) {
-            // Check if this client has been initialized (sent resize)
-            // Access the pending buffer from the connection handler
-            if ((client as any)._ptyInitialized) {
-              client.send(payload);
-            } else {
-              // Buffer the output until resize arrives
-              if (!(client as any)._ptyPending) (client as any)._ptyPending = [];
-              (client as any)._ptyPending.push(data);
-            }
+      wss.on("connection", (ws, req) => {
+        // Parse app ID from URL: /app/:id
+        const urlPath = req.url?.split("?")[0] || "/";
+        const appMatch = urlPath.match(/^\/app\/([^/]+)$/);
+        
+        if (!appMatch) {
+          ws.close();
+          return;
+        }
+
+        const appId = appMatch[1];
+        // Find app by ID (supports short IDs)
+        let app: PtyInstance | undefined;
+        for (const [fullId, inst] of instances) {
+          if (fullId === appId || fullId.startsWith(appId)) {
+            app = inst;
+            break;
           }
         }
-      });
 
-      wss.on("connection", (ws) => {
-        clients.add(ws);
-        console.log(`Client connected (${clients.size} total)`);
+        if (!app) {
+          ws.send(JSON.stringify({ type: "error", message: "app not found" }));
+          ws.close();
+          return;
+        }
 
-        // Buffer realtime output until client sends its dimensions
+        app.clients.add(ws);
+        console.log(`Client connected to ${app.name} (${app.clients.size} clients)`);
+
+        // Buffer output until client sends resize
+        let initialized = false;
+        let pending: string[] = [];
+
+        // Send output to this client
+        const outputHandler = (data: string) => {
+          if (initialized) {
+            ws.send(JSON.stringify({ type: "output", text: data }));
+          } else {
+            pending.push(data);
+          }
+        };
+
+        // Listen for PTY output
+        const onData = app.process.onData(outputHandler);
+
         ws.on("message", (data) => {
           try {
             const msg = JSON.parse(data.toString());
             if (msg.type === "input" && msg.text) {
-              ptySend(instance, msg.text);
+              ptySend(app!, msg.text);
             } else if (msg.type === "resize" && msg.cols && msg.rows) {
-              // Resize PTY to client dimensions (affects all clients)
-              ptyResize(instance, msg.cols, msg.rows);
-              // Send visible snapshot at the new size (preserve colors)
-              const snap = ptySnapshot(instance, msg.rows, false);
+              ptyResize(app!, msg.cols, msg.rows);
+              // Send visible snapshot at the new size
+              const snap = ptySnapshot(app!, msg.rows, false);
               ws.send(JSON.stringify({ type: "output", text: snap.visibleText }));
-              // Flush any buffered realtime output
-              const pending = (ws as any)._ptyPending;
-              if (pending && pending.length > 0) {
-                for (const chunk of pending) {
-                  ws.send(JSON.stringify({ type: "output", text: chunk }));
-                }
+              // Flush buffered output
+              for (const chunk of pending) {
+                ws.send(JSON.stringify({ type: "output", text: chunk }));
               }
-              (ws as any)._ptyInitialized = true;
+              pending = [];
+              initialized = true;
             }
           } catch {}
         });
 
         ws.on("close", () => {
-          clients.delete(ws);
-          console.log(`Client disconnected (${clients.size} remaining)`);
+          app!.clients.delete(ws);
+          onData.dispose(); // Remove listener
+          console.log(`Client disconnected from ${app!.name} (${app!.clients.size} remaining)`);
         });
       });
 
       process.on("SIGINT", () => {
         console.log("\nShutting down...");
-        ptyKill(instance);
+        ptyCleanup();
         wss.close();
         server.close();
         process.exit(0);
       });
       process.on("SIGTERM", () => {
-        ptyKill(instance);
+        ptyCleanup();
         wss.close();
         server.close();
         process.exit(0);
       });
 
       return;
+    }
+
+    // ── Direct mode: spawn command for interactive/snapshot ──────────────
+    if (!command) {
+      console.error("Error: no command specified");
+      console.error("Use --serve to start service manager, or provide a command to run");
+      process.exit(1);
+    }
+
+    console.log(`Spawning: ${command} ${cmdRest.join(" ")}`);
+    console.log(`  Terminal: ${resolvedCols}x${resolvedRows}, cwd: ${cwd}, term: ${term}`);
+    if (snapshot) console.log(`  Mode: snapshot (wait ${waitMs}ms)`);
+    else console.log(`  Mode: interactive (Ctrl+C to exit)`);
+    console.log();
+
+    let instance: ReturnType<typeof ptySpawn>;
+    try {
+      instance = ptySpawn({ command, args: cmdRest, cols: resolvedCols, rows: resolvedRows, cwd, term });
+    } catch (err: any) {
+      console.error(err.message);
+      process.exit(1);
     }
 
     // ── Interactive passthrough ────────────────────────────────────────

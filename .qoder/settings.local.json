@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls:*)",
+      "Bash(mkdir:*)",
+      "Bash(cp:*)",
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git push:*)",
+      "Bash(gh auth:*)",
+      "Bash(git config:*)",
+      "Bash(TOKEN=$\\(gh auth token\\) && git remote set-url origin \"https://wongchichong:${TOKEN}@github.com/wongchichong/pty.git\" && git push)",
+      "Bash(git remote:*)",
+      "Bash(TOKEN=$\\(gh auth token\\) && gh repo view missbjs/pty --json nameWithOwner 2>&1)",
+      "Bash(TOKEN=$\\(gh auth token\\) && git remote set-url origin \"https://wongchichong:${TOKEN}@github.com/missbjs/pty.git\" && git push)"
+    ]
+  }
+}
