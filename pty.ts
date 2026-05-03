@@ -24,6 +24,7 @@ export interface PtyInstance {
   cwd: string;
   createdAt: number;
   clients: Set<WsClient>; // connected WebSocket clients
+  applicationCursorKeys: boolean; // DECCKM mode - translate ESC[ to ESCO for arrow keys
 }
 
 export interface BufferSnapshot {
@@ -170,7 +171,33 @@ export function ptySpawn(opts: PtySpawnOptions): PtyInstance {
     cwd,
     createdAt: Date.now(),
     clients: new Set(),
+    applicationCursorKeys: false,
   };
+
+  // Track DECCKM (application cursor keys mode) from app output
+  const trackModes = (data: string) => {
+    // \x1b[?1h = enable application cursor keys (ESC O A/B/C/D)
+    // \x1b[?1l = disable (standard ESC [ A/B/C/D)
+    if (data.includes("\x1b[?1h") && !instance.applicationCursorKeys) {
+      instance.applicationCursorKeys = true;
+      // Broadcast mode change to all connected clients
+      for (const client of instance.clients) {
+        if (client.readyState === WsClient.OPEN) {
+          client.send(JSON.stringify({ type: "mode", applicationCursorKeys: true }));
+        }
+      }
+    }
+    if (data.includes("\x1b[?1l") && instance.applicationCursorKeys) {
+      instance.applicationCursorKeys = false;
+      // Broadcast mode change to all connected clients
+      for (const client of instance.clients) {
+        if (client.readyState === WsClient.OPEN) {
+          client.send(JSON.stringify({ type: "mode", applicationCursorKeys: false }));
+        }
+      }
+    }
+  };
+  ptyProcess.onData(trackModes);
 
   instances.set(id, instance);
 
@@ -240,6 +267,8 @@ export function ptySnapshot(instance: PtyInstance, footerRows: number = 20, stri
 
 /** Send keystrokes to the PTY */
 export function ptySend(instance: PtyInstance, text: string): void {
+  // Note: Arrow key translation is handled by WebSocket clients based on mode
+  // HTTP /send endpoint clients should send correct sequences for the app
   instance.process.write(text);
 }
 
@@ -293,6 +322,115 @@ export function ptyCleanup(): void {
     try { inst.process.kill(); } catch {}
   }
   instances.clear();
+}
+
+// ── Mouse/Touch Event Encoding ────────────────────────────────────────────
+
+/**
+ * Encode mouse events as ANSI escape sequences.
+ * Supports click, scroll, wheel events using X10/SGR encoding.
+ * 
+ * Mouse protocol modes (must be enabled by app):
+ * - X10: \x1b[M Cb Cx Cy (basic, 0-223 coords)
+ * - SGR: \x1b[< Cb ; Cx ; Cy M/m (extended, any coords, release detection)
+ */
+function encodeMouseEvent(msg: { event: string; button?: number; x?: number; y?: number; dx?: number; dy?: number }): string | null {
+  const { event, button = 0, x = 0, y = 0, dx, dy } = msg;
+  
+  // SGR extended mouse encoding (most compatible with modern terminals)
+  // Format: \x1b[< Cb ; Cx ; Cy M (press) or m (release)
+  
+  let cb = 0; // button code
+  
+  switch (event) {
+    case "click":
+      // button: 0=left, 1=middle, 2=right, 3=release
+      cb = button; // 0-3
+      return `\x1b[<${cb};${x};${y}M`;
+      
+    case "release":
+      cb = button; // same as click but with 'm' suffix
+      return `\x1b[<${cb};${x};${y}m`;
+      
+    case "scroll":
+    case "wheel":
+      // Scroll/wheel: button 4=scroll up, 5=scroll down
+      // dx/dy indicate direction: dy < 0 = up, dy > 0 = down
+      if (dy !== undefined) {
+        cb = dy < 0 ? 4 : 5;
+      } else if (dx !== undefined) {
+        // Horizontal scroll: 6=left, 7=right (less common)
+        cb = dx < 0 ? 6 : 7;
+      } else {
+        cb = 4; // default scroll up
+      }
+      return `\x1b[<${cb};${x};${y}M`;
+      
+    case "drag":
+      // Drag: button + 32 (motion indicator)
+      cb = (button ?? 0) + 32;
+      return `\x1b[<${cb};${x};${y}M`;
+      
+    case "move":
+      // Mouse move without button (requires mouse tracking mode 1003)
+      cb = 32; // motion with no button
+      return `\x1b[<${cb};${x};${y}M`;
+      
+    default:
+      return null;
+  }
+}
+
+/**
+ * Encode touch events as ANSI sequences.
+ * Touch events are mapped to mouse-like sequences since terminals
+ * don't have native touch support.
+ */
+function encodeTouchEvent(msg: { event: string; x?: number; y?: number; dx?: number; dy?: number; scale?: number }): string | null {
+  const { event, x = 0, y = 0, dx, dy, scale } = msg;
+  
+  switch (event) {
+    case "tap":
+      // Single tap → left click
+      return `\x1b[<0;${x};${y}M\x1b[<0;${x};${y}m`;
+      
+    case "doubletap":
+      // Double tap → double click (button code + 2 for double)
+      // Note: requires app to support double-click detection
+      return `\x1b[<0;${x};${y}M\x1b[<0;${x};${y}m\x1b[<0;${x};${y}M\x1b[<0;${x};${y}m`;
+      
+    case "longpress":
+      // Long press → right click
+      return `\x1b[<2;${x};${y}M\x1b[<2;${x};${y}m`;
+      
+    case "swipe":
+      // Swipe → scroll in the same direction as finger movement
+      // Swipe up (dy < 0) → scroll up (button 4), swipe down (dy > 0) → scroll down (button 5)
+      if (dx !== undefined && Math.abs(dx) > Math.abs(dy ?? 0)) {
+        // Horizontal swipe: swipe left (dx < 0) → scroll left (button 6), swipe right (dx > 0) → scroll right (button 7)
+        const scrollButton = dx > 0 ? 7 : 6;
+        return `\x1b[<${scrollButton};${x};${y}M`;
+      } else if (dy !== undefined) {
+        // Vertical swipe: swipe up (dy < 0) → scroll up (button 4), swipe down (dy > 0) → scroll down (button 5)
+        const scrollButton = dy > 0 ? 5 : 4;
+        return `\x1b[<${scrollButton};${x};${y}M`;
+      }
+      return null;
+      
+    case "pinch":
+      // Pinch gesture → Ctrl+scroll (zoom)
+      // scale > 1 = zoom in, scale < 1 = zoom out
+      if (scale !== undefined) {
+        const scrollButton = scale > 1 ? 4 : 5;
+        // Send Ctrl modifier + scroll
+        const cb = scrollButton + 16; // Ctrl modifier in SGR
+        return `\x1b[<${cb};${x};${y}M`;
+      }
+      return null;
+      
+    default:
+      return null;
+  }
 }
 
 // Auto-cleanup on exit
@@ -351,6 +489,27 @@ HTTP API (--serve mode):
   GET  /app/:id/status       Get app status
   GET  /health               Health check
   WS   /app/:id              WebSocket for real-time I/O
+
+WebSocket messages (client → server):
+  { "type": "input", "text": "..." }           Send keystrokes
+  { "type": "resize", "cols": N, "rows": N }   Resize terminal
+  { "type": "mouse", "event": "...", ... }     Mouse event
+  { "type": "touch", "event": "...", ... }     Touch gesture
+
+Mouse events:
+  { "type": "mouse", "event": "click", "button": 0, "x": 10, "y": 5 }
+  { "type": "mouse", "event": "release", "button": 0, "x": 10, "y": 5 }
+  { "type": "mouse", "event": "scroll", "x": 10, "y": 5, "dy": -1 }
+  { "type": "mouse", "event": "wheel", "x": 10, "y": 5, "dy": 1 }
+  { "type": "mouse", "event": "drag", "button": 0, "x": 10, "y": 5 }
+  button: 0=left, 1=middle, 2=right
+
+Touch gestures:
+  { "type": "touch", "event": "tap", "x": 10, "y": 5 }
+  { "type": "touch", "event": "doubletap", "x": 10, "y": 5 }
+  { "type": "touch", "event": "longpress", "x": 10, "y": 5 }
+  { "type": "touch", "event": "swipe", "x": 10, "y": 5, "dx": 50, "dy": 0 }
+  { "type": "touch", "event": "pinch", "x": 10, "y": 5, "scale": 1.5 }
 
 Examples:
   pnpm dev -- --serve --port 3000           # start service manager
@@ -516,7 +675,7 @@ Examples:
             process.exit(1);
           }
           console.log(`Started app: ${result.id.slice(0, 8)} (pid: ${result.pid})`);
-          console.log(`Connect: pnpm dev -- --connect ${result.id.slice(0, 8)}`);
+          console.log(`Connect: pnpm dev -- --connect ${result.id.slice(0, 8)} --port ${port}`);
         } catch (err: any) {
           console.error(`Failed to start app: ${err.message}`);
           process.exit(1);
@@ -569,6 +728,22 @@ Examples:
 
         const ws = new WsClient(`ws://${host}:${port}/app/${appId}`);
 
+        // Track terminal mode for arrow key translation
+        let applicationCursorKeys = false;
+
+        // Translate arrow keys based on current mode
+        const translateArrowKeys = (text: string): string => {
+          if (applicationCursorKeys) {
+            // App expects application mode: ESC [ A/B/C/D → ESC O A/B/C/D
+            return text
+              .replace(/\x1b\[A/g, "\x1bOA")  // up
+              .replace(/\x1b\[B/g, "\x1bOB")  // down
+              .replace(/\x1b\[C/g, "\x1bOC")  // right
+              .replace(/\x1b\[D/g, "\x1bOD"); // left
+          }
+          return text;
+        };
+
         // Stdin → WebSocket (set up early, before connection)
         process.stdin.on("data", (data) => {
           const key = data.toString();
@@ -579,7 +754,7 @@ Examples:
             return;
           }
           if (ws.readyState === WsClient.OPEN) {
-            ws.send(JSON.stringify({ type: "input", text: key }));
+            ws.send(JSON.stringify({ type: "input", text: translateArrowKeys(key) }));
           }
         });
 
@@ -600,8 +775,16 @@ Examples:
             if (process.stdin.isTTY) process.stdin.setRawMode(false);
             process.stderr.write(`\n\nRemote process exited with code ${msg.exitCode}\n`);
             process.exit(0);
+          } else if (msg.type === "mode") {
+            // Server notifies of terminal mode change
+            applicationCursorKeys = msg.applicationCursorKeys;
           } else if (msg.type === "ready") {
             // Server acknowledges connection
+          } else if (msg.type === "error") {
+            // Server sent error (e.g., app not found)
+            if (process.stdin.isTTY) process.stdin.setRawMode(false);
+            process.stderr.write(`Error: ${msg.message}\n`);
+            process.exit(1);
           }
         });
 
@@ -881,6 +1064,12 @@ Examples:
         app.clients.add(ws);
         console.log(`Client connected to ${app.name} (${app.clients.size} clients)`);
 
+        // Send current terminal mode to client
+        ws.send(JSON.stringify({ 
+          type: "mode", 
+          applicationCursorKeys: app.applicationCursorKeys 
+        }));
+
         // Buffer output until client sends resize
         let initialized = false;
         let pending: string[] = [];
@@ -913,6 +1102,14 @@ Examples:
               }
               pending = [];
               initialized = true;
+            } else if (msg.type === "mouse") {
+              // Mouse event: { type: "mouse", event: "click|scroll|wheel", button, x, y, dx, dy }
+              const mouseSeq = encodeMouseEvent(msg);
+              if (mouseSeq) ptySend(app!, mouseSeq);
+            } else if (msg.type === "touch") {
+              // Touch event: { type: "touch", event: "tap|swipe|pinch", x, y, dx, dy, scale }
+              const touchSeq = encodeTouchEvent(msg);
+              if (touchSeq) ptySend(app!, touchSeq);
             }
           } catch {}
         });

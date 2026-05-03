@@ -118,6 +118,10 @@ Both Terminal 3 and 4 see the same htop screen. Either can type — all clients 
 ```json
 {"type": "input", "text": "q"}              // Send keystroke
 {"type": "resize", "cols": 120, "rows": 30} // Resize terminal
+{"type": "mouse", "event": "click", "button": 0, "x": 10, "y": 5}  // Mouse click
+{"type": "mouse", "event": "scroll", "x": 10, "y": 5, "dy": -1}    // Mouse scroll
+{"type": "touch", "event": "tap", "x": 10, "y": 5}                  // Touch tap
+{"type": "touch", "event": "swipe", "x": 10, "y": 5, "dy": 50}      // Touch swipe
 ```
 
 ### Server → Client
@@ -125,8 +129,33 @@ Both Terminal 3 and 4 see the same htop screen. Either can type — all clients 
 ```json
 {"type": "output", "text": "..."}           // PTY output
 {"type": "exit", "exitCode": 0, "id": "..."} // App exited
-{"type": "error", "message": "..."}         // Error
+{"type": "error", "message": "..."}         // Error (e.g., app not found)
+{"type": "mode", "applicationCursorKeys": true}  // Terminal mode change
 ```
+
+### Mouse Events
+
+| Event | Description | Parameters |
+|-------|-------------|------------|
+| `click` | Mouse button press | `button` (0=left, 1=middle, 2=right), `x`, `y` |
+| `release` | Mouse button release | `button`, `x`, `y` |
+| `scroll` / `wheel` | Scroll wheel | `x`, `y`, `dy` (-1=up, 1=down), `dx` (horizontal) |
+| `drag` | Mouse drag | `button`, `x`, `y` |
+| `move` | Mouse movement | `x`, `y` |
+
+Mouse events use SGR extended encoding (`\x1b[<Cb;Cx;CyM`).
+
+### Touch Events
+
+| Event | Description | Mapping |
+|-------|-------------|---------|
+| `tap` | Single tap | Left click + release |
+| `doubletap` | Double tap | Double click |
+| `longpress` | Long press | Right click + release |
+| `swipe` | Swipe gesture | Scroll in swipe direction |
+| `pinch` | Pinch gesture | Ctrl+scroll (zoom) |
+
+Touch events are mapped to mouse sequences for terminal compatibility.
 
 ## Multi-Client Features
 
