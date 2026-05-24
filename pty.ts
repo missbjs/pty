@@ -6,6 +6,7 @@ import xtermHeadless from "@xterm/headless";
 import stripAnsi from "strip-ansi";
 import { randomUUID } from "crypto";
 import { WebSocketServer, WebSocket as WsClient } from "ws";
+import { existsSync } from "node:fs";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const Terminal = (xtermHeadless as any).Terminal;
@@ -113,6 +114,27 @@ function lineToAnsiString(line: any): string {
 const instances = new Map<string, PtyInstance>();
 let defaultInstance: PtyInstance | null = null; // for backward compat with single-app mode
 
+/** Resolve a command to its full path using Windows PATH */
+function resolveCommand(cmd: string): string {
+  // If already a full path or has extension, return as-is
+  if (cmd.includes("/") || cmd.includes("\\") || cmd.includes(".")) {
+    return cmd;
+  }
+  // Search PATH manually
+  const pathDirs = (process.env.PATH || "").split(process.platform === "win32" ? ";" : ":");
+  const extensions = process.platform === "win32" ? [".exe", ".cmd", ".bat", ".com"] : [""];
+  for (const dir of pathDirs) {
+    if (!dir) continue;
+    for (const ext of extensions) {
+      const fullPath = `${dir}\\${cmd}${ext}`;
+      if (existsSync(fullPath)) {
+        return fullPath;
+      }
+    }
+  }
+  return cmd;
+}
+
 /** Spawn a new process in a PTY and return the instance */
 export function ptySpawn(opts: PtySpawnOptions): PtyInstance {
   const id = randomUUID();
@@ -121,10 +143,11 @@ export function ptySpawn(opts: PtySpawnOptions): PtyInstance {
   const rows = opts.rows ?? 40;
   const term = opts.term ?? "xterm-256color";
   const cwd = opts.cwd ?? process.cwd();
+  const resolvedCommand = resolveCommand(opts.command);
 
   let ptyProcess: pty.IPty;
   try {
-    ptyProcess = pty.spawn(opts.command, opts.args ?? [], {
+    ptyProcess = pty.spawn(resolvedCommand, opts.args ?? [], {
       name: term,
       cols,
       rows,
@@ -447,7 +470,18 @@ process.on("SIGTERM", () => { ptyCleanup(); process.exit(1); });
 //   tsx src/services/pty.ts ls -la
 //   tsx src/services/pty.ts python -- -c "print('hello')"
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+// Normalize Windows paths (backslashes → forward slashes) for comparison
+function normalizeUrlPath(url: string): string {
+  return url.replace(/\\/g, "/").replace(/^file:\/+/, "file://");
+}
+
+const isMain = (() => {
+  // Always run CLI when executed directly - vite bundles everything into one file
+  // so import.meta.url and process.argv[1] will always match for the bundled output
+  return true;
+})()
+
+if (isMain) {
   (async () => {
     const args = process.argv.slice(2);
     if (args.length === 0 || args[0] === "--help" || args[0] === "-h") {
@@ -523,7 +557,7 @@ Examples:
     }
 
     // Split args at -- : left = command+args, right = pty options
-    const PTY_FLAGS = new Set(["--cols", "--rows", "--cwd", "--term", "--wait", "--color", "--interactive", "--snapshot", "--serve", "--connect", "--port", "--host", "--start", "--list", "--kill"]);
+    const PTY_FLAGS = new Set(["--cols", "--rows", "--cwd", "--term", "--wait", "--color", "--interactive", "--snapshot", "--serve", "--connect", "--port", "--host", "--start", "--list", "--kill", "--help", "-h"]);
 
     let cmdArgs: string[];
     let ptyOpts: string[];
@@ -587,6 +621,9 @@ Examples:
     let list = false;
     let kill: string | undefined;
 
+    // Check for help flags early (before parsing options)
+    const showHelp = ptyOpts.includes("--help") || ptyOpts.includes("-h");
+
     for (let i = 0; i < ptyOpts.length; i++) {
       switch (ptyOpts[i]) {
         case "--cols": cols = parseInt(ptyOpts[++i], 10); break;
@@ -604,7 +641,81 @@ Examples:
         case "--start": start = ptyOpts[++i]; break;
         case "--list": list = true; break;
         case "--kill": kill = ptyOpts[++i]; break;
+        case "--help": case "-h": break; // handled by showHelp check
       }
+    }
+
+    // Show help if requested (works whether --help is at start or after --)
+    if (showHelp) {
+      console.log(`Usage: tsx pty.ts [command] [args...] [-- <options>]
+
+PTY Service Manager — spawn, manage, and interact with TUI applications.
+
+Server mode:
+  --serve                    Start PTY service manager (HTTP + WebSocket)
+  --port <n>                 Server port (default: 3000)
+  --host <addr>              Bind address (default: 127.0.0.1)
+
+Client commands (requires running server):
+  --start <cmd> [args...]    Spawn a new TUI application
+  --list                     List all running applications
+  --kill <id>                Kill an application by ID (sends SIGTERM)
+  --connect [id]             Connect to an app interactively (default: first)
+
+Direct mode (no server):
+  <command> [args...]        Run command directly in PTY
+
+PTY options (after --):
+  --cols <n>                 Terminal width (default: 400)
+  --rows <n>                 Terminal height (default: 40)
+  --cwd <dir>                Working directory
+  --term <name>              Terminal type (default: xterm-256color)
+  --wait <ms>                Wait before snapshot (default: 1000)
+  --color                    Preserve ANSI color codes
+  --interactive              Interactive passthrough (default)
+  --snapshot                 Print snapshot and exit
+
+HTTP API (--serve mode):
+  GET  /apps                 List all running apps
+  POST /start                Spawn new app { "command": "...", "args": [] }
+  POST /kill                 Kill app { "id": "..." }
+  GET  /app/:id/snapshot     Get app snapshot
+  POST /app/:id/send         Send keystrokes { "text": "..." }
+  POST /app/:id/resize       Resize app { "cols": N, "rows": N }
+  GET  /app/:id/status       Get app status
+  GET  /health               Health check
+  WS   /app/:id              WebSocket for real-time I/O
+
+WebSocket messages (client → server):
+  { "type": "input", "text": "..." }           Send keystrokes
+  { "type": "resize", "cols": N, "rows": N }   Resize terminal
+  { "type": "mouse", "event": "...", ... }     Mouse event
+  { "type": "touch", "event": "...", ... }     Touch gesture
+
+Mouse events:
+  { "type": "mouse", "event": "click", "button": 0, "x": 10, "y": 5 }
+  { "type": "mouse", "event": "release", "button": 0, "x": 10, "y": 5 }
+  { "type": "mouse", "event": "scroll", "x": 10, "y": 5, "dy": -1 }
+  { "type": "mouse", "event": "wheel", "x": 10, "y": 5, "dy": 1 }
+  { "type": "mouse", "event": "drag", "button": 0, "x": 10, "y": 5 }
+  button: 0=left, 1=middle, 2=right
+
+Touch gestures:
+  { "type": "touch", "event": "tap", "x": 10, "y": 5 }
+  { "type": "touch", "event": "doubletap", "x": 10, "y": 5 }
+  { "type": "touch", "event": "longpress", "x": 10, "y": 5 }
+  { "type": "touch", "event": "swipe", "x": 10, "y": 5, "dx": 50, "dy": 0 }
+  { "type": "touch", "event": "pinch", "x": 10, "y": 5, "scale": 1.5 }
+
+Examples:
+  pnpm dev -- --serve --port 3000           # start service manager
+  pnpm dev -- --start htop                  # spawn htop
+  pnpm dev -- --list                        # list running apps
+  pnpm dev -- --kill abc123                 # kill app by ID
+  pnpm dev -- --connect abc123              # connect to specific app
+  pnpm dev -- --connect                     # connect to first app
+  pnpm dev htop                             # run htop directly (no server)`);
+      process.exit(0);
     }
 
     // Resolve cols/rows from TTY if not specified
