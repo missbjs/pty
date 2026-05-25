@@ -11,6 +11,12 @@ import { existsSync } from "node:fs";
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const Terminal = (xtermHeadless as any).Terminal;
 
+// ── Constants ───────────────────────────────────────────────────────────────
+const DEFAULT_COLS = 400;
+const DEFAULT_ROWS = 40;
+const MAX_PENDING_OUTPUT = 1000;
+const MAX_DIMENSION = 10000; // Max cols or rows per dimension (allows 10000x10000 = 100M cells)
+
 // ── Types ──────────────────────────────────────────────────────────────────
 
 export interface PtyInstance {
@@ -139,8 +145,8 @@ function resolveCommand(cmd: string): string {
 export function ptySpawn(opts: PtySpawnOptions): PtyInstance {
   const id = randomUUID();
 
-  const cols = opts.cols ?? 400; // wide default to avoid line wrapping
-  const rows = opts.rows ?? 40;
+  const cols = opts.cols ?? DEFAULT_COLS; // wide default to avoid line wrapping
+  const rows = opts.rows ?? DEFAULT_ROWS;
   const term = opts.term ?? "xterm-256color";
   const cwd = opts.cwd ?? process.cwd();
   const resolvedCommand = resolveCommand(opts.command);
@@ -616,6 +622,13 @@ Examples:
     let serve = false;
     let connect = false;
     let port = 3000;
+
+    // Helper to parse int with bounds checking
+    const parseBoundedInt = (val: string, min: number, max: number, def: number): number => {
+      const parsed = parseInt(val, 10);
+      if (Number.isNaN(parsed)) return def;
+      return Math.min(Math.max(parsed, min), max);
+    };
     let host = "127.0.0.1";
     let start: string | undefined;
     let list = false;
@@ -626,17 +639,17 @@ Examples:
 
     for (let i = 0; i < ptyOpts.length; i++) {
       switch (ptyOpts[i]) {
-        case "--cols": cols = parseInt(ptyOpts[++i], 10); break;
-        case "--rows": rows = parseInt(ptyOpts[++i], 10); break;
+        case "--cols": cols = parseBoundedInt(ptyOpts[++i], 1, MAX_DIMENSION, DEFAULT_COLS); break;
+        case "--rows": rows = parseBoundedInt(ptyOpts[++i], 1, MAX_DIMENSION, DEFAULT_ROWS); break;
         case "--cwd": cwd = ptyOpts[++i]; break;
         case "--term": term = ptyOpts[++i]; break;
-        case "--wait": waitMs = parseInt(ptyOpts[++i], 10); break;
+        case "--wait": waitMs = parseBoundedInt(ptyOpts[++i], 0, 60000, 1000); break;
         case "--color": color = true; break;
         case "--interactive": interactive = true; break;
         case "--snapshot": snapshot = true; break;
         case "--serve": serve = true; break;
         case "--connect": connect = true; break;
-        case "--port": port = parseInt(ptyOpts[++i], 10); break;
+        case "--port": port = parseBoundedInt(ptyOpts[++i], 1, 65535, 3000); break;
         case "--host": host = ptyOpts[++i]; break;
         case "--start": start = ptyOpts[++i]; break;
         case "--list": list = true; break;
@@ -879,8 +892,14 @@ Examples:
         });
 
         ws.on("message", (data) => {
-          const msg = JSON.parse(data.toString());
-          if (msg.type === "output") {
+          let msg: { type?: string; text?: string; exitCode?: number; applicationCursorKeys?: boolean; message?: string };
+          try {
+            msg = JSON.parse(data.toString());
+          } catch {
+            process.stderr.write("Received malformed message from server\n");
+            return;
+          }
+          if (msg.type === "output" && msg.text) {
             process.stdout.write(msg.text);
           } else if (msg.type === "exit") {
             if (process.stdin.isTTY) process.stdin.setRawMode(false);
@@ -888,10 +907,10 @@ Examples:
             process.exit(0);
           } else if (msg.type === "mode") {
             // Server notifies of terminal mode change
-            applicationCursorKeys = msg.applicationCursorKeys;
+            applicationCursorKeys = msg.applicationCursorKeys ?? false;
           } else if (msg.type === "ready") {
             // Server acknowledges connection
-          } else if (msg.type === "error") {
+          } else if (msg.type === "error" && msg.message) {
             // Server sent error (e.g., app not found)
             if (process.stdin.isTTY) process.stdin.setRawMode(false);
             process.stderr.write(`Error: ${msg.message}\n`);
@@ -988,7 +1007,14 @@ Examples:
           // POST /start - spawn a new app
           if (req.method === "POST" && pathname === "/start") {
             const body = await readBody();
-            const { command: cmd, args = [], cols: c, rows: r, cwd: wd, term: t } = JSON.parse(body);
+            let parsed: { command?: string; args?: string[]; cols?: number; rows?: number; cwd?: string; term?: string };
+            try {
+              parsed = JSON.parse(body);
+            } catch {
+              res.writeHead(400, { "Content-Type": "application/json" });
+              return res.end(JSON.stringify({ error: "invalid JSON" }));
+            }
+            const { command: cmd, args = [], cols: c, rows: r, cwd: wd, term: t } = parsed;
             if (!cmd) {
               res.writeHead(400, { "Content-Type": "application/json" });
               return res.end(JSON.stringify({ error: "command is required" }));
@@ -997,8 +1023,8 @@ Examples:
               const inst = ptySpawn({
                 command: cmd,
                 args,
-                cols: c ?? 400,
-                rows: r ?? 40,
+                cols: c ?? DEFAULT_COLS,
+                rows: r ?? DEFAULT_ROWS,
                 cwd: wd ?? process.cwd(),
                 term: t ?? "xterm-256color",
               });
@@ -1014,7 +1040,14 @@ Examples:
           // POST /kill - kill an app
           if (req.method === "POST" && pathname === "/kill") {
             const body = await readBody();
-            const { id } = JSON.parse(body);
+            let parsedKill: { id?: string };
+            try {
+              parsedKill = JSON.parse(body);
+            } catch {
+              res.writeHead(400, { "Content-Type": "application/json" });
+              return res.end(JSON.stringify({ error: "invalid JSON" }));
+            }
+            const { id } = parsedKill;
             if (!id) {
               res.writeHead(400, { "Content-Type": "application/json" });
               return res.end(JSON.stringify({ error: "id is required" }));
@@ -1080,7 +1113,14 @@ Examples:
             // POST /app/:id/send
             if (req.method === "POST" && subPath === "/send") {
               const body = await readBody();
-              const { text } = JSON.parse(body);
+              let parsedSend: { text?: string };
+              try {
+                parsedSend = JSON.parse(body);
+              } catch {
+                res.writeHead(400, { "Content-Type": "application/json" });
+                return res.end(JSON.stringify({ error: "invalid JSON" }));
+              }
+              const { text } = parsedSend;
               if (!text) {
                 res.writeHead(400, { "Content-Type": "application/json" });
                 return res.end(JSON.stringify({ error: "text is required" }));
@@ -1093,12 +1133,22 @@ Examples:
             // POST /app/:id/resize
             if (req.method === "POST" && subPath === "/resize") {
               const body = await readBody();
-              const { cols: c, rows: r } = JSON.parse(body);
-              if (!c || !r) {
+              let parsedResize: { cols?: number; rows?: number };
+              try {
+                parsedResize = JSON.parse(body);
+              } catch {
                 res.writeHead(400, { "Content-Type": "application/json" });
-                return res.end(JSON.stringify({ error: "cols and rows are required" }));
+                return res.end(JSON.stringify({ error: "invalid JSON" }));
               }
-              ptyResize(app, c, r);
+              const { cols: c, rows: r } = parsedResize;
+              // Validate bounds
+              const validCols = c ? Math.min(Math.max(1, c), MAX_DIMENSION) : undefined;
+              const validRows = r ? Math.min(Math.max(1, r), MAX_DIMENSION) : undefined;
+              if (validCols === undefined || validRows === undefined) {
+                res.writeHead(400, { "Content-Type": "application/json" });
+                return res.end(JSON.stringify({ error: "cols and rows must be valid numbers" }));
+              }
+              ptyResize(app, validCols, validRows);
               res.writeHead(200, { "Content-Type": "application/json" });
               return res.end(JSON.stringify({ ok: true, cols: c, rows: r }));
             }
@@ -1110,7 +1160,8 @@ Examples:
           // 404
           res.writeHead(404, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ error: "not found" }));
-        } catch {
+        } catch (err) {
+          console.error("HTTP handler error:", err);
           res.writeHead(500, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ error: "internal error" }));
         }
@@ -1185,11 +1236,22 @@ Examples:
         let initialized = false;
         let pending: string[] = [];
 
+        // Auto-initialize after timeout to prevent unbounded buffering
+        const initTimeout = setTimeout(() => {
+          if (!initialized) {
+            initialized = true;
+            for (const chunk of pending) {
+              ws.send(JSON.stringify({ type: "output", text: chunk }));
+            }
+            pending = [];
+          }
+        }, 5000);
+
         // Send output to this client
         const outputHandler = (data: string) => {
           if (initialized) {
             ws.send(JSON.stringify({ type: "output", text: data }));
-          } else {
+          } else if (pending.length < MAX_PENDING_OUTPUT) {
             pending.push(data);
           }
         };
@@ -1222,10 +1284,13 @@ Examples:
               const touchSeq = encodeTouchEvent(msg);
               if (touchSeq) ptySend(app!, touchSeq);
             }
-          } catch {}
+          } catch (err) {
+            console.error("WebSocket message parse error:", err);
+          }
         });
 
         ws.on("close", () => {
+          clearTimeout(initTimeout);
           app!.clients.delete(ws);
           onData.dispose(); // Remove listener
           console.log(`Client disconnected from ${app!.name} (${app!.clients.size} remaining)`);
