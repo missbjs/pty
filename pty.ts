@@ -482,6 +482,8 @@ function normalizeUrlPath(url: string): string {
 }
 
 const isMain = (() => {
+  // Skip CLI when running in test mode (vitest sets NODE_ENV=test or VITE_TEST)
+  if (process.env.NODE_ENV === "test" || process.env.VITEST) return false;
   // Always run CLI when executed directly - vite bundles everything into one file
   // so import.meta.url and process.argv[1] will always match for the bundled output
   return true;
