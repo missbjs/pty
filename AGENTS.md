@@ -9,10 +9,10 @@ Guide for AI agents working in this codebase.
 ## Essential Commands
 
 ```bash
-# Development
+# Development (installed globally the same commands are `pty ...`)
 pnpm dev <command> [args...] [-- <pty-options>]   # Run TUI in PTY (interactive mode)
-pnpm build                                         # Build dist/pty.js (Vite + tsc)
-pnpm test                                          # Run tests (vitest)
+pnpm build                                         # Build dist/pty.js + dist/pty.d.ts (Vite + tsc)
+pnpm test                                          # Build, then run tests (vitest, ~1 min)
 
 # Examples
 pnpm dev top                                       # Run top in PTY
@@ -27,25 +27,27 @@ The build is two-step:
 1. `vite build` — bundles to ESM, externalizes native deps
 2. `tsc --emitDeclarationOnly` — generates `.d.ts` types
 
-**Important:** `node-pty` is a native module. It must be rebuilt when Node version changes. If `pnpm install` fails with node-gyp errors, ensure build tools are available (python3, make, g++).
+**Important:** `dist/` is **committed** (the package is installed straight from GitHub, which runs no build). Run `pnpm build` (or `pnpm test`, whose `pretest` builds) and commit `dist/` together with any change to `pty.ts`.
+
+`node-pty` is a native module with prebuilt binaries for Windows/macOS; on Linux it compiles from source (python3, make, g++). `package.json` has `pnpm.onlyBuiltDependencies: ["node-pty"]` so a local `pnpm install` runs its install script; a *global* install from GitHub cannot grant that, which is harmless where prebuilds exist.
 
 ### Test Structure
 
-Tests are in `pty.test.ts`. Two test suites:
-- Core PTY API tests (spawn, snapshot, send, resize, etc.)
-- WebSocket serve/connect integration tests (spawn server process, test HTTP endpoints)
+Tests live in `pty.harness.test.ts` (keys, paste, wait, exit status, colour snapshots, tree kill, auth/CSRF guards, in-process server and CLI subprocess; needs only `node`; ports 3160-3169) and `pty.test.ts` (core API + WebSocket scenarios, uses Unix tools via Git Bash on Windows; port 3190). Test files run one after the other (`fileParallelism: false`).
 
-Tests require the built artifact (`dist/pty.js`). The `pretest` script runs `vite build` automatically.
+Tests require the built artifact (`dist/pty.js`). The `pretest` script runs `pnpm build` automatically.
 
 ## Architecture
 
 ### Single-File Design
 
-All code is in `pty.ts` (~800 lines). No separate modules. Exports:
+All code is in `pty.ts`. No separate modules. Exports:
 
-- **Core API**: `ptySpawn`, `ptySnapshot`, `ptySend`, `ptySignal`, `ptyResize`, `ptyKill`, `ptyGet`, `ptyList`, `ptyCleanup`
-- **Types**: `PtyInstance`, `BufferSnapshot`, `PtySpawnOptions`
-- **CLI**: Runs when `import.meta.url === file://${process.argv[1]}`
+- **Core API**: `ptySpawn`, `ptySnapshot`, `ptyScreenText`, `ptySend`, `ptyInput` (text/paste/named keys), `keyToSequence`, `ptyWait`, `ptyWaitExit`, `ptySignal`, `ptyResize`, `ptyKill`, `ptyGet`, `ptyGetAny`, `ptyList`, `ptyFinished`, `ptyCleanup`, `resolveCommand`
+- **Server**: `createPtyServer({ host, port, token })` -> `{ server, wss, listen(), close() }`
+- **CLI helpers**: `splitCliArgs`, `parseEnvPairs`, `isLoopbackHost`
+- **Types**: `PtyInstance`, `BufferSnapshot`, `PtySpawnOptions`, `PtyWaitOptions`, `PtyInputOptions`
+- **CLI**: runs only when this file is the executed program (`realpath(process.argv[1]) === realpath(import.meta.url)`). Do NOT gate it on `NODE_ENV`/`VITEST` — child servers spawned by tests inherit those variables.
 
 ### Data Flow
 
@@ -101,15 +103,7 @@ The `outputAccum` is capped at 2KB (`ACCUM_CAP = 2048`). This is intentional —
 
 ### ANSI Color Reconstruction
 
-When `stripAnsiCodes: false`, the snapshot reconstructs ANSI codes from xterm cell attributes:
-
-```typescript
-function lineToAnsiString(line: any): string {
-  // For each cell: getFgColor(), getBgColor() → emit \e[38;5;Nm codes
-}
-```
-
-This is lossy — only 256-color palette is reconstructed, not truecolor (RGB).
+When `stripAnsiCodes: false`, the snapshot reconstructs ANSI codes from xterm cell attributes (`cellSgr()` / `lineToAnsiString()`): bold, dim, italic, underline, blink, inverse, invisible, strikethrough, 256-palette (`38;5;N`) and truecolor (`38;2;r;g;b`) foreground/background. Trailing blank unstyled cells are trimmed and wide-char continuation cells skipped. Still lossy for underline colour/style variants and hyperlinks.
 
 ### WebSocket Multi-Client
 
@@ -139,9 +133,9 @@ pnpm build
 
 ### node-pty Native Module
 
-- Must rebuild on Node version change
-- Fails if build tools missing (python3, make, g++)
-- `approvedBuilds: ["node-pty"]` in package.json signals it's safe to run postinstall scripts
+- Windows/macOS use prebuilt binaries (no compiler needed); Linux must compile (python3, make, g++) and rebuild on Node version change
+- `pnpm.onlyBuiltDependencies: ["node-pty"]` in package.json lets pnpm >= 10 run its install script locally
+- Windows ConPTY quirks: input is re-encoded (`ESC O A` -> `ESC [ A`), bracketed-paste markers on input are dropped, there are no POSIX signals (`ptySignal` kills), and a node process holding a ConPTY child will not exit by itself — use `process.exit`.
 
 ### Terminal Size Defaults
 
@@ -156,11 +150,11 @@ pnpm dev my-app --model auto --snapshot
 # → command: "my-app", args: ["--model", "auto"], ptyOpts: ["--snapshot"]
 ```
 
-PTY flags: `--cols`, `--rows`, `--cwd`, `--term`, `--wait`, `--color`, `--interactive`, `--snapshot`, `--serve`, `--connect`, `--port`, `--host`
+PTY flags: `--cols`, `--rows`, `--cwd`, `--term`, `--wait`, `--color`, `--interactive`, `--snapshot`, `--serve`, `--connect`, `--port`, `--host`, plus the client flags (`--start --list --kill --screen --status --send --wait-for --env --token --json ...`; see `splitCliArgs()`). When the first token is a command, only the historic flags split without a `--`. `--start <cmd> a b c` takes `a b c` as the command's args until the next pty flag (`--` forces the rest).
 
 ### Process Exit Detection
 
-`node-pty` doesn't throw for non-existent commands — it spawns successfully, then the process exits immediately with non-zero code. The code detects this via:
+On POSIX `node-pty` doesn't throw for non-existent commands — it spawns successfully, then the process exits immediately with non-zero code (on Windows `ptySpawn` throws `Failed to spawn ...`). The code detects this via:
 
 1. Exit code ≠ 0
 2. Output < 500 bytes
@@ -168,12 +162,10 @@ PTY flags: `--cols`, `--rows`, `--cwd`, `--term`, `--wait`, `--color`, `--intera
 
 ### Instance Cleanup
 
-Instances are tracked in a `Map<string, PtyInstance>`. On exit:
+Running instances are tracked in `instances`; on exit they move to `finished` (last 20 kept, with final screen, `exitCode`, `signal`) so harnesses can read the result after the app died. On shutdown:
 - `process.on("exit")` → `ptyCleanup()` kills all
 - `process.on("SIGINT/SIGTERM")` → cleanup + exit
-- Individual `ptyKill()` removes from map
-
-After process exit, instance is deleted after 5 second delay (allows late snapshot).
+- `ptyKill()` is a no-op for exited apps, closes the pseudo-console (kills the tree on Windows) and escalates to `taskkill /T /F` / process-group SIGKILL after 1.5 s.
 
 ## Skills
 
@@ -189,15 +181,15 @@ Skills are in `skills/<name>/SKILL.md`. Each includes scripts and reference docs
 
 ### WebSocket Tests
 
-The WebSocket test suite spawns a real server process (`dist/pty.js`) on port 13099. Tests:
+The WebSocket test suite spawns a real server process (`dist/pty.js`) on port 3190. Tests:
 - HTTP endpoints (`/health`, `/snapshot`, `/status`, `/send`, `/resize`)
 - WebSocket connection and message protocol
 - Multi-client broadcast
 
-If port 13099 is in use, tests will fail. Kill any lingering processes:
+If port 3190 is in use, tests will fail. Kill any lingering processes:
 
 ```bash
-lsof -i :13099  # or check /proc on systems without lsof
+lsof -i :3190  # or check /proc on systems without lsof
 ```
 
 ### Timing Dependencies
