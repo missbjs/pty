@@ -47,9 +47,17 @@ export interface PtyInstance {
   exitedAt: number | null;
   /** epoch ms of the last byte of PTY output (used by wait-for-idle) */
   lastOutputAt: number;
-  /** total bytes of PTY output seen */
+  /** total characters of PTY output seen so far; monotonically increasing, doubles as the stream "offset" */
   outputBytes: number;
+  /** true if the app was ended by ptyKill()/ptySignal() (on Windows its exitCode is then the Ctrl-C status -1073741510) */
+  killed: boolean;
+  /** recent raw output (last ~2M chars) and the offset of its first char; backs "new output only" waits */
+  tail: string;
+  tailStart: number;
 }
+
+/** Raw-output history kept per app for offset-based waits */
+const TAIL_CAP = 2_000_000;
 
 export interface BufferSnapshot {
   /** Full buffer: all lines including scrollback */
@@ -237,6 +245,12 @@ export function ptySpawn(opts: PtySpawnOptions): PtyInstance {
   ptyProcess.onData((data) => {
     instance.lastOutputAt = Date.now();
     instance.outputBytes += data.length;
+    instance.tail += data;
+    if (instance.tail.length > TAIL_CAP * 1.5) {
+      const drop = instance.tail.length - TAIL_CAP;
+      instance.tail = instance.tail.slice(drop);
+      instance.tailStart += drop;
+    }
     if (outputAccum.length < ACCUM_CAP) {
       outputAccum += data;
       if (outputAccum.length > ACCUM_CAP) outputAccum = outputAccum.slice(0, ACCUM_CAP);
@@ -271,6 +285,9 @@ export function ptySpawn(opts: PtySpawnOptions): PtyInstance {
     exitedAt: null,
     lastOutputAt: Date.now(),
     outputBytes: 0,
+    killed: false,
+    tail: "",
+    tailStart: 0,
   };
 
   // Track DECCKM (application cursor keys mode) from app output
@@ -356,6 +373,21 @@ export function ptyScreenText(instance: PtyInstance, scope: "visible" | "full" =
   const buf = instance.terminal.buffer.active;
   const start = scope === "full" ? 0 : buf.baseY;
   return readLines(instance, start, buf.length, stripAnsiCodes).join("\n");
+}
+
+/**
+ * Trim trailing blank lines, keep lines matching `grep` (JS RegExp source), then keep the last `tail` lines.
+ * Used by `--screen --tail N --grep RE` to keep long-session output small.
+ */
+export function ptyFilterLines(lines: string[], opts: { grep?: string; ignoreCase?: boolean; tail?: number } = {}): string[] {
+  let out = lines.slice();
+  while (out.length && out[out.length - 1].trim() === "") out.pop();
+  if (opts.grep) {
+    const re = new RegExp(opts.grep, opts.ignoreCase ? "i" : "");
+    out = out.filter((l) => re.test(l.replace(/\x1b\[[0-9;]*m/g, "")));
+  }
+  if (opts.tail !== undefined && opts.tail >= 0) out = opts.tail === 0 ? [] : out.slice(-opts.tail);
+  return out;
 }
 
 /** Get a snapshot of the full buffer */
@@ -446,6 +478,8 @@ export function keyToSequence(name: string, applicationCursorKeys: boolean = fal
     return applicationCursorKeys ? `\x1bO${code}` : `\x1b[${code}`;
   }
   if (lower === "tab" && shift && !ctrl && !alt) return "\x1b[Z";
+  // Shift-Enter has no classic encoding; CSI-u ("fixterms") is what terminals that distinguish it send
+  if ((lower === "enter" || lower === "return") && shift && !ctrl && !alt) return "\x1b[13;2u";
   let seq: string;
   if (SIMPLE_KEYS[lower] !== undefined) {
     seq = ctrl && lower === "space" ? "\x00" : SIMPLE_KEYS[lower];
@@ -469,6 +503,9 @@ export function keyToSequence(name: string, applicationCursorKeys: boolean = fal
   return alt ? "\x1b" + seq : seq;
 }
 
+/** Thrown by ptyInput when a `require` guard fails (HTTP 412) */
+export class PtyPreconditionError extends Error {}
+
 export interface PtyInputOptions {
   /** Raw text written first, exactly as given */
   text?: string;
@@ -478,6 +515,15 @@ export interface PtyInputOptions {
   bracketed?: boolean;
   /** Named keys, sent one at a time after text/paste */
   keys?: string[];
+  /**
+   * How to enter the line breaks of `paste`. Default "cr" = CR-joined text (plus bracketed-paste markers when the
+   * app enabled them). Any key name (e.g. "M-Enter", "S-Enter", "C-j") or "lf" makes the paste be TYPED: each line is
+   * sent as text, with that key between lines — the robust way to put multi-line text into a prompt box where a
+   * bare CR would submit (and ConPTY drops bracketed-paste markers). "literal" = send the text unchanged.
+   */
+  newlineAs?: string;
+  /** Refuse (PtyPreconditionError, nothing sent) unless the current screen contains this text */
+  require?: string;
   /** Pause between text, paste and each key (ms, default 30, max 5000). ESC immediately followed by another byte reads as Alt+<byte>, so keys are never batched. */
   delayMs?: number;
 }
@@ -495,8 +541,12 @@ export function pasteSequence(instance: PtyInstance, text: string, bracketed?: b
  */
 export async function ptyInput(instance: PtyInstance, opts: PtyInputOptions): Promise<void> {
   const delay = Math.min(Math.max(opts.delayMs ?? 30, 0), 5000);
+  if (opts.require !== undefined && !ptyScreenText(instance, "visible", true).includes(opts.require)) {
+    throw new PtyPreconditionError(`screen does not contain required text ${JSON.stringify(opts.require)}; nothing was sent`);
+  }
   const dcck = () => !!instance.terminal?.modes?.applicationCursorKeysMode || instance.applicationCursorKeys;
   for (const k of opts.keys ?? []) keyToSequence(k, dcck()); // validate up-front
+  if (opts.newlineAs && opts.newlineAs !== "cr" && opts.newlineAs !== "lf" && opts.newlineAs !== "literal") keyToSequence(opts.newlineAs, dcck());
   let first = true;
   const part = async (data: string) => {
     if (!first && delay > 0) await sleep(delay);
@@ -505,7 +555,21 @@ export async function ptyInput(instance: PtyInstance, opts: PtyInputOptions): Pr
     ptySend(instance, data);
   };
   if (opts.text) await part(opts.text);
-  if (opts.paste) await part(pasteSequence(instance, opts.paste, opts.bracketed));
+  if (opts.paste) {
+    const nl = opts.newlineAs;
+    if (nl === undefined || nl === "cr") {
+      await part(pasteSequence(instance, opts.paste, opts.bracketed));
+    } else if (nl === "literal") {
+      await part(opts.paste);
+    } else {
+      const sep = nl === "lf" ? "\n" : keyToSequence(nl, dcck());
+      const lines = opts.paste.split(/\r\n|\n|\r/);
+      for (let i = 0; i < lines.length; i++) {
+        if (i > 0) await part(sep);
+        if (lines[i]) await part(lines[i]);
+      }
+    }
+  }
   for (const k of opts.keys ?? []) await part(keyToSequence(k, dcck()));
 }
 
@@ -524,6 +588,16 @@ export interface PtyWaitOptions {
   timeoutMs?: number;
   /** "visible" (default) = the current screen only; "full" = screen + scrollback */
   scope?: "visible" | "full";
+  /**
+   * Only count output produced after this stream offset (see `instance.outputBytes`, `offset` in status/snapshot/
+   * send replies): text/regex are then matched against the new output (ANSI stripped) instead of the whole screen,
+   * so a string left on screen by an earlier turn does not match.
+   */
+  after?: number;
+  /** Shorthand for after = the offset at the moment of this call */
+  newOnly?: boolean;
+  /** For `idleMs`: additionally require at least this many new output chars since `after` / the call start */
+  minNewBytes?: number;
   /** Poll interval ms (default 50) */
   pollMs?: number;
   /** Abort early (e.g. HTTP client went away) */
@@ -536,6 +610,14 @@ export interface PtyWaitResult {
   elapsedMs: number;
   exited: boolean;
   exitCode: number | null;
+  /** stream offset at return time — pass it as `after` to wait for what happens next */
+  offset: number;
+}
+
+/** Plain text (ANSI stripped) of the raw output produced after `offset`; older than the kept history is clipped. */
+export function ptyOutputSince(instance: PtyInstance, offset: number): string {
+  const from = Math.max(offset - instance.tailStart, 0);
+  return stripAnsi(instance.tail.slice(from)).replace(/\r/g, "");
 }
 
 /**
@@ -552,17 +634,22 @@ export async function ptyWait(instance: PtyInstance, opts: PtyWaitOptions = {}):
   const hasScreenCond = opts.text !== undefined || re !== undefined || opts.gone !== undefined;
   const idleMs = opts.idleMs ?? (hasScreenCond ? undefined : 500);
   const t0 = Date.now();
+  const startOffset = instance.outputBytes;
+  const base = opts.after ?? (opts.newOnly ? startOffset : undefined);
+  const minNew = opts.minNewBytes ?? 0;
   const res = (matched: boolean, reason: PtyWaitResult["reason"]): PtyWaitResult => ({
-    matched, reason, elapsedMs: Date.now() - t0, exited: instance.exited, exitCode: instance.exitCode,
+    matched, reason, elapsedMs: Date.now() - t0, exited: instance.exited, exitCode: instance.exitCode, offset: instance.outputBytes,
   });
   for (;;) {
     if (hasScreenCond) {
       const screen = ptyScreenText(instance, scope, true);
-      if (opts.text !== undefined && screen.includes(opts.text)) return res(true, "text");
-      if (re && re.test(screen)) return res(true, "regex");
+      const searched = base !== undefined ? ptyOutputSince(instance, base) : screen;
+      if (opts.text !== undefined && searched.includes(opts.text)) return res(true, "text");
+      if (re && re.test(searched)) return res(true, "regex");
       if (opts.gone !== undefined && !screen.includes(opts.gone)) return res(true, "gone");
     }
-    if (idleMs !== undefined && Date.now() - instance.lastOutputAt >= idleMs) return res(true, "idle");
+    if (idleMs !== undefined && Date.now() - instance.lastOutputAt >= idleMs &&
+        instance.outputBytes - (base ?? startOffset) >= minNew) return res(true, "idle");
     if (instance.exited) return res(false, "exit");
     if (opts.isCancelled?.()) return res(false, "cancelled");
     if (Date.now() - t0 >= timeoutMs) return res(false, "timeout");
@@ -618,6 +705,7 @@ function killTree(pid: number): void {
  */
 export function ptyKill(instance: PtyInstance): void {
   if (instance.exited) return;
+  instance.killed = true;
   try { instance.process.kill(); } catch {}
   const t = setTimeout(() => { if (!instance.exited) killTree(instance.process.pid); }, 1500);
   t.unref?.();
@@ -694,15 +782,15 @@ function encodeMouseEvent(msg: { event: string; button?: number; x?: number; y?:
       
     case "scroll":
     case "wheel":
-      // Scroll/wheel: button 4=scroll up, 5=scroll down
+      // SGR wheel events set bit 6 (64): 64=up, 65=down, 66=left, 67=right.
       // dx/dy indicate direction: dy < 0 = up, dy > 0 = down
       if (dy !== undefined) {
-        cb = dy < 0 ? 4 : 5;
+        cb = dy < 0 ? 64 : 65;
       } else if (dx !== undefined) {
-        // Horizontal scroll: 6=left, 7=right (less common)
-        cb = dx < 0 ? 6 : 7;
+        // Horizontal scroll (less common)
+        cb = dx < 0 ? 66 : 67;
       } else {
-        cb = 4; // default scroll up
+        cb = 64; // default scroll up
       }
       return `\x1b[<${cb};${x};${y}M`;
       
@@ -748,11 +836,11 @@ function encodeTouchEvent(msg: { event: string; x?: number; y?: number; dx?: num
       // Swipe up (dy < 0) → scroll up (button 4), swipe down (dy > 0) → scroll down (button 5)
       if (dx !== undefined && Math.abs(dx) > Math.abs(dy ?? 0)) {
         // Horizontal swipe: swipe left (dx < 0) → scroll left (button 6), swipe right (dx > 0) → scroll right (button 7)
-        const scrollButton = dx > 0 ? 7 : 6;
+        const scrollButton = dx > 0 ? 67 : 66;
         return `\x1b[<${scrollButton};${x};${y}M`;
       } else if (dy !== undefined) {
         // Vertical swipe: swipe up (dy < 0) → scroll up (button 4), swipe down (dy > 0) → scroll down (button 5)
-        const scrollButton = dy > 0 ? 5 : 4;
+        const scrollButton = dy > 0 ? 65 : 64;
         return `\x1b[<${scrollButton};${x};${y}M`;
       }
       return null;
@@ -761,7 +849,7 @@ function encodeTouchEvent(msg: { event: string; x?: number; y?: number; dx?: num
       // Pinch gesture → Ctrl+scroll (zoom)
       // scale > 1 = zoom in, scale < 1 = zoom out
       if (scale !== undefined) {
-        const scrollButton = scale > 1 ? 4 : 5;
+        const scrollButton = scale > 1 ? 64 : 65;
         // Send Ctrl modifier + scroll
         const cb = scrollButton + 16; // Ctrl modifier in SGR
         return `\x1b[<${cb};${x};${y}M`;
@@ -909,7 +997,12 @@ export function createPtyServer(opts: PtyServerOptions): PtyServer {
     exitCode: inst.exitCode,
     signal: inst.signal,
     exitedAt: inst.exitedAt,
+    /** "running" | "exited" | "killed" (killed = ended by /kill; on Windows its exitCode is the Ctrl-C status -1073741510) */
+    exitStatus: !inst.exited ? "running" : inst.killed ? "killed" : "exited",
+    killed: inst.killed,
     outputBytes: inst.outputBytes,
+    /** stream offset: pass to wait?after=N to only look at output produced after now */
+    offset: inst.outputBytes,
     lastOutputAt: inst.lastOutputAt,
   });
 
@@ -994,7 +1087,7 @@ export function createPtyServer(opts: PtyServerOptions): PtyServer {
         log(`Killed: ${app.name} (id: ${app.id.slice(0, 8)})`);
         ptyKill(app);
         await ptyWaitExit(app, 3000);
-        return send(res, 200, { ok: true, exited: app.exited, exitCode: app.exitCode });
+        return send(res, 200, { ok: true, exited: app.exited, exitCode: app.exitCode, killed: app.killed });
       }
 
       // GET /health (never needs the token)
@@ -1017,13 +1110,31 @@ export function createPtyServer(opts: PtyServerOptions): PtyServer {
         if (req.method === "GET" && subPath === "/snapshot") {
           const color = truthy(url.searchParams.get("color"));
           const full = truthy(url.searchParams.get("full"));
+          const expectText = url.searchParams.get("expect");
+          if (expectText !== null && !ptyScreenText(app, "visible", true).includes(expectText)) {
+            return send(res, 412, { error: `screen does not contain expected text ${JSON.stringify(expectText)}`, visibleText: ptyScreenText(app, "visible", true) });
+          }
           const snap = ptySnapshot(app, 20, !color);
+          const tailQ = url.searchParams.get("tail");
+          const grepQ = url.searchParams.get("grep");
+          const filtered = tailQ !== null || grepQ !== null;
+          let filteredLines: string[] = [];
+          if (filtered) {
+            const tailN = tailQ === null ? undefined : Number(tailQ);
+            if (tailN !== undefined && (!Number.isInteger(tailN) || tailN < 0)) return send(res, 400, { error: "tail must be a non-negative integer" });
+            try {
+              filteredLines = ptyFilterLines(full ? snap.fullLines : snap.visibleLines, { grep: grepQ ?? undefined, ignoreCase: truthy(url.searchParams.get("ignoreCase")), tail: tailN });
+            } catch { return send(res, 400, { error: "invalid grep regex" }); }
+          }
           if (url.searchParams.get("format") === "text") {
-            const text = (full ? snap.fullText : snap.visibleText).replace(/(\r?\n)+$/, "");
+            const text = (filtered ? filteredLines.join("\n") : (full ? snap.fullText : snap.visibleText)).replace(/(\r?\n)+$/, "");
             res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
-            return res.end(text + "\n");
+            return res.end(text === "" ? "" : text + "\n");
           }
           return send(res, 200, {
+            ...(filtered ? { lines: filteredLines, text: filteredLines.join("\n") } : {}),
+            offset: app.outputBytes,
+            killed: app.killed,
             visibleText: snap.visibleText,
             visibleLines: snap.visibleLines,
             ...(full ? { fullText: snap.fullText, scrollbackLineCount: snap.scrollbackLines.length } : {}),
@@ -1056,7 +1167,11 @@ export function createPtyServer(opts: PtyServerOptions): PtyServer {
           };
           const idleMs = numQ("idle");
           const timeoutMs = numQ("timeout");
-          if (Number.isNaN(idleMs) || Number.isNaN(timeoutMs)) return send(res, 400, { error: "idle and timeout must be numbers (ms)" });
+          const afterN = numQ("after");
+          const minNew = numQ("minNewBytes");
+          if ([idleMs, timeoutMs, afterN, minNew].some((v) => v !== undefined && Number.isNaN(v))) {
+            return send(res, 400, { error: "idle, timeout, after and minNewBytes must be numbers" });
+          }
           const scope = q.get("scope") === "full" ? "full" : "visible";
           let regex: RegExp | undefined;
           if (q.get("regex")) {
@@ -1071,6 +1186,9 @@ export function createPtyServer(opts: PtyServerOptions): PtyServer {
             idleMs,
             timeoutMs,
             scope,
+            after: afterN,
+            newOnly: truthy(q.get("new")),
+            minNewBytes: minNew,
             isCancelled: () => cancelled,
           });
           if (cancelled) return;
@@ -1085,7 +1203,7 @@ export function createPtyServer(opts: PtyServerOptions): PtyServer {
         if (req.method === "POST" && subPath === "/send") {
           const parsedSend = await parseJson();
           if (!parsedSend) return;
-          const { text, paste, keys, bracketed, delayMs } = parsedSend;
+          const { text, paste, keys, bracketed, delayMs, newlineAs, require: requireText } = parsedSend;
           if (!text && !paste && !(Array.isArray(keys) && keys.length)) {
             return send(res, 400, { error: "text is required (or paste / keys)" });
           }
@@ -1093,17 +1211,22 @@ export function createPtyServer(opts: PtyServerOptions): PtyServer {
               (keys !== undefined && (!Array.isArray(keys) || keys.some((k) => typeof k !== "string")))) {
             return send(res, 400, { error: "text and paste must be strings, keys an array of strings" });
           }
+          if ((newlineAs !== undefined && typeof newlineAs !== "string") || (requireText !== undefined && typeof requireText !== "string")) {
+            return send(res, 400, { error: "newlineAs and require must be strings" });
+          }
           if (app.exited) return send(res, 409, { error: "app has exited", exitCode: app.exitCode });
+          const offsetBefore = app.outputBytes;
           try {
             await ptyInput(app, {
-              text, paste, keys,
+              text, paste, keys, newlineAs, require: requireText,
               bracketed: typeof bracketed === "boolean" ? bracketed : undefined,
               delayMs: typeof delayMs === "number" ? delayMs : undefined,
             });
           } catch (err: any) {
+            if (err instanceof PtyPreconditionError) return send(res, 412, { error: err.message });
             return send(res, /unknown key/.test(err.message) ? 400 : 409, { error: err.message });
           }
-          return send(res, 200, { ok: true });
+          return send(res, 200, { ok: true, offset: offsetBefore });
         }
 
         // POST /app/:id/kill  (same as POST /kill {id})
@@ -1112,7 +1235,7 @@ export function createPtyServer(opts: PtyServerOptions): PtyServer {
           log(`Killed: ${app.name} (id: ${app.id.slice(0, 8)})`);
           ptyKill(app);
           await ptyWaitExit(app, 3000);
-          return send(res, 200, { ok: true, exited: app.exited, exitCode: app.exitCode });
+          return send(res, 200, { ok: true, exited: app.exited, exitCode: app.exitCode, killed: app.killed });
         }
 
         // POST /app/:id/resize
@@ -1276,6 +1399,7 @@ const PTY_FLAGS = new Set([
   "--env", "--token", "--json", "--all",
   "--screen", "--status", "--send", "--wait-for",
   "--text", "--paste", "--paste-file", "--keys", "--delay", "--regex", "--gone", "--idle", "--timeout", "--scope", "--full",
+  "--newline-as", "--after", "--min-new-bytes", "--expect", "--require", "--tail", "--grep", "--new-only", "--ignore-case",
 ]);
 /** Flags that existed before the client commands were added: the only ones that split `pty <command> <args> --flag` (no `--`) */
 const LEGACY_FLAGS = new Set([
@@ -1287,6 +1411,7 @@ const VALUE_FLAGS = new Set([
   "--cols", "--rows", "--cwd", "--term", "--wait", "--port", "--host", "--start", "--kill", "--env", "--token",
   "--screen", "--status", "--send", "--wait-for",
   "--text", "--paste", "--paste-file", "--keys", "--delay", "--regex", "--gone", "--idle", "--timeout", "--scope",
+  "--newline-as", "--after", "--min-new-bytes", "--expect", "--require", "--tail", "--grep",
 ]);
 
 export interface SplitArgs {
@@ -1379,10 +1504,17 @@ Client commands (talk to a running server; same --port/--host/--token):
   --list [--all]             List running apps (--all: also recently exited ones)
   --status <id>              Show status incl. exit code
   --screen <id>              Print the screen as plain text (--color: ANSI, --full: with scrollback)
+                             --tail <n>  last n non-blank lines;  --grep <re> [--ignore-case]  only matching lines
+                             --expect <text>  exit 3 (prints nothing) unless the screen contains <text>
   --send <id>                Send input: --text "raw" | --paste "multi\\nline" | --paste-file f | --keys Enter,Escape,C-c,Up
                              (--delay <ms> between parts, default 30)
+                             --newline-as M-Enter|S-Enter|C-j|lf|literal  type a multi-line --paste line by line with that
+                               key between lines (robust for prompt boxes; default: CR-joined / bracketed paste)
+                             --require <text>  refuse (exit 3, nothing sent) unless the screen contains <text>
   --wait-for <id>            Block until --text "s" | --regex "re" | --gone "s" | --idle <ms> or --timeout <ms>
                              (default 30000). Exit code 0 = matched, 2 = timeout/exited. Prints the screen.
+                             --new-only | --after <offset>  only count output produced after now / after that stream
+                               offset (printed by --send, --wait-for, --status as offset=N); --min-new-bytes <n> for --idle
   --kill <id>                Kill the app and its whole process tree
   --connect [id]             Interactive attach (Ctrl+C detaches)
   --json                     Print raw JSON responses instead of text
@@ -1472,6 +1604,9 @@ if (isMain) {
     let sendText: string | undefined, sendPaste: string | undefined, sendKeys: string[] | undefined, sendDelay: number | undefined;
     let waitRegex: string | undefined, waitGone: string | undefined, waitIdle: number | undefined, waitTimeout: number | undefined;
     let scope: string | undefined;
+    let newlineAs: string | undefined, after: number | undefined, minNewBytes: number | undefined;
+    let expectText: string | undefined, requireText: string | undefined, tailN: number | undefined, grepRe: string | undefined;
+    let newOnly = false, ignoreCase = false;
 
     // Helper to parse int with bounds checking
     const parseBoundedInt = (val: string, min: number, max: number, def: number): number => {
@@ -1524,6 +1659,15 @@ if (isMain) {
         case "--idle": waitIdle = parseBoundedInt(ptyOpts[++i], 0, 600000, 500); break;
         case "--timeout": waitTimeout = parseBoundedInt(ptyOpts[++i], 0, 600000, 30000); break;
         case "--scope": scope = ptyOpts[++i]; break;
+        case "--newline-as": newlineAs = ptyOpts[++i]; break;
+        case "--after": after = parseBoundedInt(ptyOpts[++i], 0, Number.MAX_SAFE_INTEGER, 0); break;
+        case "--min-new-bytes": minNewBytes = parseBoundedInt(ptyOpts[++i], 0, Number.MAX_SAFE_INTEGER, 0); break;
+        case "--expect": expectText = ptyOpts[++i]; break;
+        case "--require": requireText = ptyOpts[++i]; break;
+        case "--tail": tailN = parseBoundedInt(ptyOpts[++i], 0, 1000000, 50); break;
+        case "--grep": grepRe = ptyOpts[++i]; break;
+        case "--new-only": newOnly = true; break;
+        case "--ignore-case": ignoreCase = true; break;
         case "--help": case "-h": break; // handled by showHelp check
       }
     }
@@ -1617,7 +1761,7 @@ if (isMain) {
         const { status, body } = await call("POST", "/kill", { id: kill });
         if (status !== 200) fail(`Error: ${body.error}`);
         if (json) return out(body);
-        console.log(`Killed app: ${kill}${body.exitCode !== null && body.exitCode !== undefined ? ` (exit code ${body.exitCode})` : ""}`);
+        console.log(`Killed app: ${kill}${body.exitCode !== null && body.exitCode !== undefined ? ` (killed: ${body.killed === true}, raw exit code ${body.exitCode})` : ""}`);
         return;
       }
 
@@ -1628,14 +1772,18 @@ if (isMain) {
       }
 
       if (screenId) {
-        const q = `color=${color}&full=${full}&format=${json ? "json" : "text"}`;
+        let q = `color=${color}&full=${full}&format=${json ? "json" : "text"}`;
+        if (expectText !== undefined) q += `&expect=${encodeURIComponent(expectText)}`;
+        if (tailN !== undefined) q += `&tail=${tailN}`;
+        if (grepRe !== undefined) q += `&grep=${encodeURIComponent(grepRe)}`;
+        if (ignoreCase) q += "&ignoreCase=true";
         if (json) {
           const { status, body } = await call("GET", `/app/${encodeURIComponent(screenId)}/snapshot?${q}`);
-          if (status !== 200) fail(`Error: ${body.error}`);
+          if (status !== 200) fail(`Error: ${body.error}`, status === 412 ? 3 : 1);
           return out(body);
         }
         const res = await fetch(`${baseUrl}/app/${encodeURIComponent(screenId)}/snapshot?${q}`, { headers }).catch((e) => fail(`Cannot reach a PTY server at ${baseUrl}: ${e.message}`));
-        if (res.status !== 200) fail(`Error: ${((await res.json().catch(() => ({ error: res.statusText }))) as { error?: string }).error}`);
+        if (res.status !== 200) fail(`Error: ${((await res.json().catch(() => ({ error: res.statusText }))) as { error?: string }).error}`, res.status === 412 ? 3 : 1);
         process.stdout.write(await res.text());
         return;
       }
@@ -1643,10 +1791,10 @@ if (isMain) {
       if (sendId) {
         if (sendText === undefined && sendPaste === undefined && !sendKeys?.length) fail("--send needs --text, --paste, --paste-file or --keys");
         const { status, body } = await call("POST", `/app/${encodeURIComponent(sendId)}/send`, {
-          text: sendText, paste: sendPaste, keys: sendKeys, delayMs: sendDelay,
+          text: sendText, paste: sendPaste, keys: sendKeys, delayMs: sendDelay, newlineAs, require: requireText,
         });
-        if (status !== 200) fail(`Error: ${body.error}`);
-        if (json) out(body); else console.log("Sent.");
+        if (status !== 200) fail(`Error: ${body.error}`, status === 412 ? 3 : 1);
+        if (json) out(body); else { console.log("Sent."); console.error(`offset=${body.offset}`); }
         return;
       }
 
@@ -1659,11 +1807,14 @@ if (isMain) {
         if (waitTimeout !== undefined) p.set("timeout", String(waitTimeout));
         if (scope) p.set("scope", scope);
         if (color) p.set("color", "true");
+        if (after !== undefined) p.set("after", String(after));
+        if (newOnly) p.set("new", "true");
+        if (minNewBytes !== undefined) p.set("minNewBytes", String(minNewBytes));
         const { status, body } = await call("GET", `/app/${encodeURIComponent(waitForId)}/wait?${p}`);
         if (status !== 200) fail(`Error: ${body.error}`);
         if (json) out(body);
         else {
-          console.error(`wait: ${body.matched ? "matched" : "NOT matched"} (${body.reason}) after ${body.elapsedMs}ms${body.exited ? `, app exited with code ${body.exitCode}` : ""}`);
+          console.error(`wait: ${body.matched ? "matched" : "NOT matched"} (${body.reason}) after ${body.elapsedMs}ms${body.exited ? `, app exited with code ${body.exitCode}` : ""}, offset=${body.offset}`);
           console.log(String(body.visibleText ?? "").replace(/(\r?\n)+$/, ""));
         }
         process.exit(body.matched ? 0 : 2);

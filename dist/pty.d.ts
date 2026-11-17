@@ -24,8 +24,13 @@ export interface PtyInstance {
     exitedAt: number | null;
     /** epoch ms of the last byte of PTY output (used by wait-for-idle) */
     lastOutputAt: number;
-    /** total bytes of PTY output seen */
+    /** total characters of PTY output seen so far; monotonically increasing, doubles as the stream "offset" */
     outputBytes: number;
+    /** true if the app was ended by ptyKill()/ptySignal() (on Windows its exitCode is then the Ctrl-C status -1073741510) */
+    killed: boolean;
+    /** recent raw output (last ~2M chars) and the offset of its first char; backs "new output only" waits */
+    tail: string;
+    tailStart: number;
 }
 export interface BufferSnapshot {
     /** Full buffer: all lines including scrollback */
@@ -73,6 +78,15 @@ export declare function resolveCommand(cmd: string): string;
 export declare function ptySpawn(opts: PtySpawnOptions): PtyInstance;
 /** Text of the visible screen (cheap: reads only the viewport) or of the full buffer incl. scrollback. */
 export declare function ptyScreenText(instance: PtyInstance, scope?: "visible" | "full", stripAnsiCodes?: boolean): string;
+/**
+ * Trim trailing blank lines, keep lines matching `grep` (JS RegExp source), then keep the last `tail` lines.
+ * Used by `--screen --tail N --grep RE` to keep long-session output small.
+ */
+export declare function ptyFilterLines(lines: string[], opts?: {
+    grep?: string;
+    ignoreCase?: boolean;
+    tail?: number;
+}): string[];
 /** Get a snapshot of the full buffer */
 export declare function ptySnapshot(instance: PtyInstance, footerRows?: number, stripAnsiCodes?: boolean): BufferSnapshot;
 /** Send keystrokes to the PTY */
@@ -86,6 +100,9 @@ export declare function ptySend(instance: PtyInstance, text: string): void;
  * Throws on an unknown name.
  */
 export declare function keyToSequence(name: string, applicationCursorKeys?: boolean): string;
+/** Thrown by ptyInput when a `require` guard fails (HTTP 412) */
+export declare class PtyPreconditionError extends Error {
+}
 export interface PtyInputOptions {
     /** Raw text written first, exactly as given */
     text?: string;
@@ -95,6 +112,15 @@ export interface PtyInputOptions {
     bracketed?: boolean;
     /** Named keys, sent one at a time after text/paste */
     keys?: string[];
+    /**
+     * How to enter the line breaks of `paste`. Default "cr" = CR-joined text (plus bracketed-paste markers when the
+     * app enabled them). Any key name (e.g. "M-Enter", "S-Enter", "C-j") or "lf" makes the paste be TYPED: each line is
+     * sent as text, with that key between lines — the robust way to put multi-line text into a prompt box where a
+     * bare CR would submit (and ConPTY drops bracketed-paste markers). "literal" = send the text unchanged.
+     */
+    newlineAs?: string;
+    /** Refuse (PtyPreconditionError, nothing sent) unless the current screen contains this text */
+    require?: string;
     /** Pause between text, paste and each key (ms, default 30, max 5000). ESC immediately followed by another byte reads as Alt+<byte>, so keys are never batched. */
     delayMs?: number;
 }
@@ -118,6 +144,16 @@ export interface PtyWaitOptions {
     timeoutMs?: number;
     /** "visible" (default) = the current screen only; "full" = screen + scrollback */
     scope?: "visible" | "full";
+    /**
+     * Only count output produced after this stream offset (see `instance.outputBytes`, `offset` in status/snapshot/
+     * send replies): text/regex are then matched against the new output (ANSI stripped) instead of the whole screen,
+     * so a string left on screen by an earlier turn does not match.
+     */
+    after?: number;
+    /** Shorthand for after = the offset at the moment of this call */
+    newOnly?: boolean;
+    /** For `idleMs`: additionally require at least this many new output chars since `after` / the call start */
+    minNewBytes?: number;
     /** Poll interval ms (default 50) */
     pollMs?: number;
     /** Abort early (e.g. HTTP client went away) */
@@ -129,7 +165,11 @@ export interface PtyWaitResult {
     elapsedMs: number;
     exited: boolean;
     exitCode: number | null;
+    /** stream offset at return time — pass it as `after` to wait for what happens next */
+    offset: number;
 }
+/** Plain text (ANSI stripped) of the raw output produced after `offset`; older than the kept history is clipped. */
+export declare function ptyOutputSince(instance: PtyInstance, offset: number): string;
 /**
  * Wait until ANY of the given conditions holds (checked in order: text, regex, gone, idle),
  * the app exits (reason "exit", matched=false) or the timeout elapses (reason "timeout").

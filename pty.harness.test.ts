@@ -11,7 +11,7 @@ import { WebSocket as WsClient } from "ws";
 import {
   ptySpawn, ptySnapshot, ptyKill, ptyCleanup, ptyGet, ptyGetAny, ptyList, ptyWait, ptyWaitExit, ptyInput,
   ptyScreenText, keyToSequence, pasteSequence, resolveCommand, splitCliArgs, parseEnvPairs, isLoopbackHost,
-  createPtyServer, type PtyInstance, type PtyServer,
+  createPtyServer, ptyFilterLines, ptyOutputSince, PtyPreconditionError, type PtyInstance, type PtyServer,
 } from "./pty.js";
 
 const NODE = process.execPath;
@@ -42,6 +42,23 @@ beforeAll(() => {
     console.log('ARGV=' + JSON.stringify(process.argv.slice(2)));
     console.log('CWD=' + process.cwd());
     console.log('FOO=' + process.env.FOO + ' BAR=' + process.env.BAR + ' TERM=' + process.env.TERM);
+    setInterval(() => {}, 1000);
+  `);
+  // line editor: Enter prints ECHO:<buffer>; ESC-CR (Alt-Enter) inserts "<nl>" into the buffer instead of submitting
+  writeFileSync(join(dir, "echoline.cjs"), `
+    process.stdin.setRawMode(true); process.stdin.resume();
+    let buf = '', esc = false;
+    process.stdout.write('READY\\n');
+    process.stdin.on('data', d => {
+      for (const ch of d.toString('latin1')) {
+        if (ch === '\\x1b') { esc = true; continue; }
+        if (ch === '\\r') {
+          if (esc) buf += '<nl>';
+          else { process.stdout.write('ECHO:' + buf + '\\n'); buf = ''; }
+        } else buf += ch;
+        esc = false;
+      }
+    });
     setInterval(() => {}, 1000);
   `);
   // spawns a grandchild that touches a heartbeat file every 100ms
@@ -710,4 +727,215 @@ describe("CLI (built dist/pty.js as a subprocess)", () => {
     expect(r.code).toBe(1);
     expect(r.err).toMatch(/already in use/);
   }, 30000);
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Round 2: typed multi-line input, new-output waits, guards, tail/grep, killed flag
+// ═════════════════════════════════════════════════════════════════════════════
+describe("round 2: library", () => {
+  const live: PtyInstance[] = [];
+  afterEach(() => { for (const i of live.splice(0)) ptyKill(i); });
+  const spawn = (o: Parameters<typeof ptySpawn>[0]) => { const i = ptySpawn(o); live.push(i); return i; };
+  const got = (inst: PtyInstance) => ptyScreenText(inst).split("\n").filter((l) => l.startsWith("GOT:")).map((l) => l.slice(4));
+
+  it("Shift-Enter key and Alt-Enter", () => {
+    expect(keyToSequence("S-Enter")).toBe("\x1b[13;2u");
+    expect(keyToSequence("Shift+Return")).toBe("\x1b[13;2u");
+    expect(keyToSequence("M-Enter")).toBe("\x1b\r");
+    expect(keyToSequence("C-j")).toBe("\n");
+  });
+
+  it("ptyFilterLines trims trailing blanks, greps (optionally case-insensitive) and tails", () => {
+    const lines = ["alpha", "Beta", "", "gamma", "\x1b[31mbeta red\x1b[0m", "", ""];
+    expect(ptyFilterLines(lines)).toEqual(["alpha", "Beta", "", "gamma", "\x1b[31mbeta red\x1b[0m"]);
+    expect(ptyFilterLines(lines, { tail: 2 })).toEqual(["gamma", "\x1b[31mbeta red\x1b[0m"]);
+    expect(ptyFilterLines(lines, { grep: "beta" })).toEqual(["\x1b[31mbeta red\x1b[0m"]);
+    expect(ptyFilterLines(lines, { grep: "beta", ignoreCase: true })).toEqual(["Beta", "\x1b[31mbeta red\x1b[0m"]);
+    expect(ptyFilterLines(lines, { grep: "^beta" })).toEqual(["\x1b[31mbeta red\x1b[0m"]); // anchors apply to the text, not the SGR codes
+    expect(ptyFilterLines(lines, { tail: 0 })).toEqual([]);
+    expect(() => ptyFilterLines(lines, { grep: "(" })).toThrow();
+  });
+
+  it("newlineAs types a multi-line paste line by line with the given key between lines", async () => {
+    const inst = spawn({ command: "node", args: [join(dir, "keyecho.cjs")] });
+    await ptyWait(inst, { text: "READY" });
+    await ptyInput(inst, { paste: "one\ntwo\r\nthree", newlineAs: "M-Enter", delayMs: 80 });
+    await ptyWait(inst, { idleMs: 300 });
+    const chunks = got(inst).map((h) => Buffer.from(h, "hex").toString("latin1"));
+    const joined = chunks.join("|");
+    // each line arrives as its own chunk, separated by ESC CR (Alt-Enter) — never a bare CR that would submit
+    expect(chunks.join("")).toBe("one\x1b\rtwo\x1b\rthree");
+    expect(chunks.length).toBeGreaterThanOrEqual(5);
+    expect(joined).not.toMatch(/(^|\|)\r(\||$)/);
+  });
+
+  it("newlineAs 'literal' sends the text untouched and 'lf' uses LF; bad key names are rejected", async () => {
+    const inst = spawn({ command: "node", args: [join(dir, "keyecho.cjs")] });
+    await ptyWait(inst, { text: "READY" });
+    await ptyInput(inst, { paste: "a\nb", newlineAs: "lf", delayMs: 0 });
+    await ptyWait(inst, { idleMs: 300 });
+    expect(got(inst).map((h) => Buffer.from(h, "hex").toString("latin1")).join("")).toBe("a\nb");
+    await expect(ptyInput(inst, { paste: "x\ny", newlineAs: "Nope" })).rejects.toThrow(/unknown key/);
+  });
+
+  it("require guard refuses to send unless the screen has the text", async () => {
+    const inst = spawn({ command: "node", args: [join(dir, "keyecho.cjs")] });
+    await ptyWait(inst, { text: "READY" });
+    await expect(ptyInput(inst, { text: "/model", keys: ["Enter"], require: "NOT_ON_SCREEN" })).rejects.toBeInstanceOf(PtyPreconditionError);
+    await sleep(300);
+    expect(got(inst)).toEqual([]);
+    await ptyInput(inst, { text: "ok", require: "READY" });
+    await ptyWait(inst, { text: "GOT:" });
+    expect(got(inst).join("")).toContain("6f6b");
+  });
+
+  it("new-output waits: stale screen text does not match; --after / newOnly / minNewBytes", async () => {
+    const inst = spawn({ command: "node", args: [join(dir, "echoline.cjs")] });
+    await ptyWait(inst, { text: "READY" });
+    await ptyInput(inst, { text: "first", keys: ["Enter"] });
+    await ptyWait(inst, { text: "ECHO:first" });
+    // still on screen -> plain wait matches at once, new-only does not
+    expect((await ptyWait(inst, { text: "ECHO:first", timeoutMs: 2000 })).matched).toBe(true);
+    expect(await ptyWait(inst, { text: "ECHO:first", newOnly: true, timeoutMs: 400 })).toMatchObject({ matched: false, reason: "timeout" });
+
+    const off = inst.outputBytes;
+    expect(off).toBeGreaterThan(0);
+    // idle that also demands new bytes can't be satisfied while nothing new arrives
+    expect((await ptyWait(inst, { idleMs: 100, minNewBytes: 5, after: off, timeoutMs: 400 })).reason).toBe("timeout");
+    await ptyInput(inst, { text: "second", keys: ["Enter"] });
+    const r = await ptyWait(inst, { text: "ECHO:second", after: off, timeoutMs: 8000 });
+    expect(r).toMatchObject({ matched: true, reason: "text" });
+    expect(r.offset).toBeGreaterThan(off);
+    // old text is not in the output after `off`
+    expect((await ptyWait(inst, { text: "ECHO:first", after: off, timeoutMs: 300 })).matched).toBe(false);
+    expect(ptyOutputSince(inst, off)).toContain("ECHO:second");
+    expect(ptyOutputSince(inst, off)).not.toContain("ECHO:first");
+    // quiet + enough new bytes since `off`
+    expect(await ptyWait(inst, { idleMs: 200, minNewBytes: 5, after: off, timeoutMs: 8000 })).toMatchObject({ matched: true, reason: "idle" });
+  });
+
+  it("killed flag: set by ptyKill, not by a natural exit", async () => {
+    const a = spawn({ command: "node", args: ["-e", "setInterval(()=>{},1000)"] });
+    await sleep(300);
+    ptyKill(a);
+    await ptyWaitExit(a, 8000);
+    expect(a.killed).toBe(true);
+    const b = spawn({ command: "node", args: ["-e", "process.exit(0)"] });
+    await ptyWaitExit(b, 8000);
+    expect(b.killed).toBe(false);
+    expect(b.exitCode).toBe(0);
+  });
+});
+
+describe("round 2: HTTP + CLI", () => {
+  const PORT = 3165;
+  const base = `http://127.0.0.1:${PORT}`;
+  let svc: ReturnType<typeof import("node:child_process").spawn>;
+  const post = async (path: string, body: unknown) => {
+    const res = await fetch(base + path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    return { status: res.status, body: await res.json() as any };
+  };
+  const get = async (path: string) => {
+    const res = await fetch(base + path);
+    return { status: res.status, body: await res.json() as any };
+  };
+  const cli = (args: string[]) => new Promise<{ code: number; out: string; err: string }>((resolve) => {
+    execFile(NODE, ["dist/pty.js", "--port", String(PORT), ...args], { timeout: 30000 }, (e, out, err) => {
+      resolve({ code: e ? ((e as any).code ?? 1) : 0, out: String(out), err: String(err) });
+    });
+  });
+
+  beforeAll(async () => {
+    const { spawn } = await import("node:child_process");
+    svc = spawn(NODE, ["dist/pty.js", "--serve", "--port", String(PORT)], { stdio: ["ignore", "pipe", "pipe"] });
+    await new Promise<void>((resolve, reject) => {
+      const t = setTimeout(() => reject(new Error("server did not start")), 15000);
+      svc.stdout!.on("data", (d: Buffer) => { if (d.toString().includes("listening on")) { clearTimeout(t); resolve(); } });
+    });
+  }, 20000);
+  afterAll(async () => { svc.kill(); await sleep(300); });
+
+  it("status/snapshot expose offset, killed and exitStatus; /kill reports killed", async () => {
+    const { body: { id } } = await post("/start", { command: "node", args: [join(dir, "echoline.cjs")] });
+    await get(`/app/${id}/wait?text=READY&timeout=8000`);
+    const st = (await get(`/app/${id}/status`)).body;
+    expect(st).toMatchObject({ running: true, killed: false, exitStatus: "running" });
+    expect(st.offset).toBeGreaterThan(0);
+    expect((await get(`/app/${id}/snapshot`)).body.offset).toBeGreaterThanOrEqual(st.offset);
+    const k = await post("/kill", { id });
+    expect(k.body).toMatchObject({ ok: true, exited: true, killed: true });
+    expect((await get(`/app/${id}/status`)).body).toMatchObject({ running: false, killed: true, exitStatus: "killed" });
+    const { body: { id: id2 } } = await post("/start", { command: "node", args: ["-e", "process.exit(4)"] });
+    await get(`/app/${id2}/wait?text=nothing&timeout=5000&screen=false`);
+    expect((await get(`/app/${id2}/status`)).body).toMatchObject({ exitCode: 4, killed: false, exitStatus: "exited" });
+  }, 30000);
+
+  it("snapshot expect/tail/grep and send require/newlineAs over HTTP", async () => {
+    const { body: { id } } = await post("/start", { command: "node", args: ["-e", "for(let i=1;i<=12;i++)console.log((i%2?'odd':'Even')+' line '+i); setInterval(()=>{},1000)"], cols: 80, rows: 30 });
+    await get(`/app/${id}/wait?text=${encodeURIComponent("line 12")}&timeout=8000`);
+    const expectFail = await get(`/app/${id}/snapshot?expect=NOPE`);
+    expect(expectFail.status).toBe(412);
+    expect(expectFail.body.error).toMatch(/does not contain/);
+    expect((await get(`/app/${id}/snapshot?expect=${encodeURIComponent("line 12")}`)).status).toBe(200);
+
+    const tail = (await get(`/app/${id}/snapshot?tail=3`)).body;
+    expect(tail.lines).toEqual(["Even line 10", "odd line 11", "Even line 12"]);
+    const grep = (await get(`/app/${id}/snapshot?grep=${encodeURIComponent("^Even")}&tail=2`)).body;
+    expect(grep.lines).toEqual(["Even line 10", "Even line 12"]);
+    const ic = (await get(`/app/${id}/snapshot?grep=EVEN&ignoreCase=true`)).body;
+    expect(ic.lines.length).toBe(6);
+    const text = await (await fetch(`${base}/app/${id}/snapshot?format=text&full=true&tail=2`)).text();
+    expect(text).toBe("odd line 11\nEven line 12\n");
+    expect((await get(`/app/${id}/snapshot?tail=-1`)).status).toBe(400);
+    expect((await get(`/app/${id}/snapshot?grep=${encodeURIComponent("(")}`)).status).toBe(400);
+
+    const refused = await post(`/app/${id}/send`, { text: "/model", keys: ["Enter"], require: "NOT_THERE" });
+    expect(refused.status).toBe(412);
+    const ok = await post(`/app/${id}/send`, { text: "x", require: "line 12" });
+    expect(ok.status).toBe(200);
+    expect(ok.body.offset).toEqual(expect.any(Number));
+    expect((await post(`/app/${id}/send`, { paste: "a\nb", newlineAs: "Bogus" })).status).toBe(400);
+    expect((await post(`/app/${id}/send`, { paste: "a\nb", newlineAs: 5 })).status).toBe(400);
+    await post("/kill", { id });
+  }, 30000);
+
+  it("CLI: --screen --expect/--tail/--grep, --send --require/--newline-as, --wait-for --new-only/--after", async () => {
+    const start = await cli(["--start", "node", join(dir, "echoline.cjs"), "--cols", "100", "--json"]);
+    const { id } = JSON.parse(start.out);
+    const sid = id.slice(0, 8);
+    await cli(["--wait-for", sid, "--text", "READY", "--timeout", "8000"]);
+
+    // guards: exit code 3 and nothing printed / sent
+    const e = await cli(["--screen", sid, "--expect", "NOT_THERE"]);
+    expect(e.code).toBe(3);
+    expect(e.out).toBe("");
+    expect(e.err).toMatch(/does not contain/);
+    expect((await cli(["--screen", sid, "--expect", "READY"])).code).toBe(0);
+    const r = await cli(["--send", sid, "--text", "/model", "--keys", "Enter", "--require", "NOT_THERE"]);
+    expect(r.code).toBe(3);
+    await sleep(300);
+    expect((await cli(["--screen", sid, "--grep", "model"])).out).toBe(""); // nothing was typed
+
+    // typed multi-line input; echoline prints ECHO:<line> per CR and treats ESC-CR as "newline in buffer" marker "<nl>"
+    const st0 = JSON.parse((await cli(["--status", sid])).out);
+    expect(typeof st0.offset).toBe("number");
+    const send = await cli(["--send", sid, "--paste", "l1\nl2\nl3", "--newline-as", "M-Enter", "--delay", "40", "--keys", "Enter"]);
+    expect(send.code).toBe(0);
+    expect(send.err).toMatch(/offset=\d+/);
+    const w = await cli(["--wait-for", sid, "--text", "ECHO:l1<nl>l2<nl>l3", "--after", String(st0.offset), "--timeout", "8000"]);
+    expect(w.code).toBe(0);
+    expect(w.err).toMatch(/offset=\d+/);
+
+    // the line is now old news: plain wait matches, --new-only does not
+    expect((await cli(["--wait-for", sid, "--text", "ECHO:l1<nl>l2<nl>l3", "--timeout", "1500"])).code).toBe(0);
+    expect((await cli(["--wait-for", sid, "--text", "ECHO:l1<nl>l2<nl>l3", "--new-only", "--timeout", "500"])).code).toBe(2);
+
+    const tail = await cli(["--screen", sid, "--tail", "1"]);
+    expect(tail.out.trim()).toBe("ECHO:l1<nl>l2<nl>l3");
+    const grep = await cli(["--screen", sid, "--grep", "echo:", "--ignore-case", "--full"]);
+    expect(grep.out.trim()).toBe("ECHO:l1<nl>l2<nl>l3");
+
+    const k = await cli(["--kill", sid]);
+    expect(k.out).toMatch(/killed: true, raw exit code/);
+  }, 90000);
 });

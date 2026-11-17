@@ -1,6 +1,6 @@
 {
   "name": "pty",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Generic PTY process manager — spawn TUI apps in a pseudo-terminal, capture buffer snapshots, broadcast over HTTP/WebSocket.",
   "main": "./dist/pty.js",
   "types": "./dist/pty.d.ts",

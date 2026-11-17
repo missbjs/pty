@@ -43,7 +43,7 @@ Tests require the built artifact (`dist/pty.js`). The `pretest` script runs `pnp
 
 All code is in `pty.ts`. No separate modules. Exports:
 
-- **Core API**: `ptySpawn`, `ptySnapshot`, `ptyScreenText`, `ptySend`, `ptyInput` (text/paste/named keys), `keyToSequence`, `ptyWait`, `ptyWaitExit`, `ptySignal`, `ptyResize`, `ptyKill`, `ptyGet`, `ptyGetAny`, `ptyList`, `ptyFinished`, `ptyCleanup`, `resolveCommand`
+- **Core API** (1.2.0 adds `ptyOutputSince`, `ptyFilterLines`, `PtyPreconditionError`): `ptySpawn`, `ptySnapshot`, `ptyScreenText`, `ptySend`, `ptyInput` (text/paste/named keys), `keyToSequence`, `ptyWait`, `ptyWaitExit`, `ptySignal`, `ptyResize`, `ptyKill`, `ptyGet`, `ptyGetAny`, `ptyList`, `ptyFinished`, `ptyCleanup`, `resolveCommand`
 - **Server**: `createPtyServer({ host, port, token })` -> `{ server, wss, listen(), close() }`
 - **CLI helpers**: `splitCliArgs`, `parseEnvPairs`, `isLoopbackHost`
 - **Types**: `PtyInstance`, `BufferSnapshot`, `PtySpawnOptions`, `PtyWaitOptions`, `PtyInputOptions`
@@ -104,6 +104,15 @@ The `outputAccum` is capped at 2KB (`ACCUM_CAP = 2048`). This is intentional —
 ### ANSI Color Reconstruction
 
 When `stripAnsiCodes: false`, the snapshot reconstructs ANSI codes from xterm cell attributes (`cellSgr()` / `lineToAnsiString()`): bold, dim, italic, underline, blink, inverse, invisible, strikethrough, 256-palette (`38;5;N`) and truecolor (`38;2;r;g;b`) foreground/background. Trailing blank unstyled cells are trimmed and wide-char continuation cells skipped. Still lossy for underline colour/style variants and hyperlinks.
+
+### Stream offsets, guards, killed flag (1.2.0)
+
+- `instance.outputBytes` is a monotonically increasing count of PTY output characters = the stream **offset**. Each app also keeps the last ~2M chars of raw output (`tail`/`tailStart`). `ptyWait({ after | newOnly, minNewBytes })` matches `text`/`regex` against `ptyOutputSince(inst, offset)` (ANSI-stripped raw output) instead of the screen, so stale on-screen text can't match. `/send` returns the pre-send offset, `/wait` the offset at return.
+- `ptyInput({ require })` throws `PtyPreconditionError` (HTTP 412) when the visible screen lacks the text; `GET /snapshot?expect=` does the same for reads. CLI exit code 3.
+- `ptyInput({ paste, newlineAs })`: any key name (or `lf`) types the paste line by line with that key between lines (ConPTY drops bracketed-paste markers, so this is the reliable multi-line entry); `literal` = untouched; default = CR-joined + bracketed markers.
+- `instance.killed` is set by `ptyKill`/`ptySignal`; status/kill replies expose `killed` and `exitStatus` ("running" | "exited" | "killed"). Raw `exitCode` of a killed app is `-1073741510` on Windows.
+- SGR mouse wheel buttons are 64/65/66/67 (+16 with Ctrl), not the X11 4/5/6/7.
+- `--screen --tail/--grep` and `snapshot?tail=&grep=` use `ptyFilterLines` (trim trailing blanks, grep on ANSI-stripped text, then tail).
 
 ### WebSocket Multi-Client
 

@@ -1673,6 +1673,8 @@ describe("WebSocket serve/connect", () => {
     });
   });
 
+  // SGR (1006) wheel events carry bit 6 (64): up=64, down=65, left=66, right=67 (+16 with Ctrl, so pinch-zoom = 80/81).
+  // The old expectation (buttons 4/5/6/7) was the X11 button numbering, which SGR-mode apps read as extra buttons, not wheel.
   it("encodes mouse scroll event correctly", async () => {
     const { WebSocket } = await import("ws");
 
@@ -1699,8 +1701,8 @@ describe("WebSocket serve/connect", () => {
     });
 
     const output = msgs.map(m => { try { return JSON.parse(m).text || ""; } catch { return ""; } }).join("");
-    expect(output).toContain("[<4;10;5M");
-    expect(output).toContain("[<5;10;5M");
+    expect(output).toContain("[<64;10;5M");
+    expect(output).toContain("[<65;10;5M");
 
     ws.close();
     await fetch(`http://127.0.0.1:${TEST_PORT}/kill`, {
@@ -1834,9 +1836,9 @@ describe("WebSocket serve/connect", () => {
       ws.on("open", () => {
         ws.send(JSON.stringify({ type: "resize", cols: 80, rows: 24 }));
         setTimeout(() => {
-          // Swipe up (dy < 0) → scroll up (button 4)
+          // Swipe up (dy < 0) → wheel up (64)
           ws.send(JSON.stringify({ type: "touch", event: "swipe", x: 10, y: 5, dy: -50 }));
-          // Swipe down (dy > 0) → scroll down (button 5)
+          // Swipe down (dy > 0) → wheel down (65)
           ws.send(JSON.stringify({ type: "touch", event: "swipe", x: 10, y: 5, dy: 50 }));
         }, 200);
       });
@@ -1845,9 +1847,9 @@ describe("WebSocket serve/connect", () => {
     });
 
     const output = msgs.map(m => { try { return JSON.parse(m).text || ""; } catch { return ""; } }).join("");
-    // Swipe up = scroll up (button 4), swipe down = scroll down (button 5)
-    expect(output).toContain("[<4;10;5M");
-    expect(output).toContain("[<5;10;5M");
+    // Swipe up = wheel up (64), swipe down = wheel down (65)
+    expect(output).toContain("[<64;10;5M");
+    expect(output).toContain("[<65;10;5M");
 
     ws.close();
     await fetch(`http://127.0.0.1:${TEST_PORT}/kill`, {
@@ -1882,7 +1884,7 @@ describe("WebSocket serve/connect", () => {
     });
 
     const output = msgs.map(m => { try { return JSON.parse(m).text || ""; } catch { return ""; } }).join("");
-    expect(output).toContain("[<20;10;5M");
+    expect(output).toContain("[<80;10;5M");
 
     ws.close();
     await fetch(`http://127.0.0.1:${TEST_PORT}/kill`, {
@@ -1988,8 +1990,8 @@ describe("WebSocket serve/connect", () => {
     });
 
     const output = msgs.map(m => { try { return JSON.parse(m).text || ""; } catch { return ""; } }).join("");
-    expect(output).toContain("[<6;10;5M");
-    expect(output).toContain("[<7;10;5M");
+    expect(output).toContain("[<66;10;5M");
+    expect(output).toContain("[<67;10;5M");
 
     ws.close();
     await fetch(`http://127.0.0.1:${TEST_PORT}/kill`, {

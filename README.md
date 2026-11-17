@@ -85,10 +85,10 @@ the command's own args from pty options.
 | `--term <name>` | `xterm-256color` | `TERM` for the app (`COLORTERM=truecolor` is always set) |
 | `--list [--all]` | | Running apps (`--all`: also the last 20 exited ones) |
 | `--status <id>` | | Status JSON incl. `running`, `exitCode` |
-| `--screen <id> [--color] [--full]` | | Print the screen as plain text (`--color`: ANSI colours, `--full`: plus scrollback) |
-| `--send <id> --text T \| --paste P \| --paste-file F \| --keys K1,K2` | | Send input (see [Input](#input)); `--delay <ms>` between parts (default 30) |
-| `--wait-for <id> --text T \| --regex R \| --gone T \| --idle <ms>` | | Block until a condition holds. `--timeout <ms>` (default 30000), `--scope full`. Prints the screen; **exit code 0 matched, 2 timeout/exited** |
-| `--kill <id>` | | Kill the app and its process tree; prints the exit code |
+| `--screen <id> [--color] [--full]` | | Print the screen as plain text (`--color`: ANSI colours, `--full`: plus scrollback). `--tail N` = last N non-blank lines, `--grep RE [--ignore-case]` = only matching lines (grep, then tail). `--expect TEXT` = exit **3** and print nothing unless the screen contains TEXT |
+| `--send <id> --text T \| --paste P \| --paste-file F \| --keys K1,K2` | | Send input (see [Input](#input)); `--delay <ms>` between parts (default 30). `--newline-as M-Enter\|S-Enter\|C-j\|lf\|literal` types a multi-line paste line by line (see below). `--require TEXT` = exit **3** and send nothing unless the screen contains TEXT. Prints `Sent.` and (stderr) `offset=N` |
+| `--wait-for <id> --text T \| --regex R \| --gone T \| --idle <ms>` | | Block until a condition holds. `--timeout <ms>` (default 30000), `--scope full`. Prints the screen; **exit code 0 matched, 2 timeout/exited**. `--new-only` / `--after <offset>`: only output produced after now / after that stream offset counts; `--min-new-bytes N` additionally requires N new chars before `--idle` can fire |
+| `--kill <id>` | | Kill the app and its process tree; prints `killed: true` and the raw exit code |
 | `--connect [id]` | | Interactive attach over WebSocket (Ctrl+C detaches) |
 | `--json` | | Raw JSON output for client commands (`--start --json` prints the full id) |
 | `--snapshot [--wait ms] [--color]` | | Direct mode: run a command, print one snapshot, exit |
@@ -123,20 +123,39 @@ pty --kill $ID                                         # tree kill
 
 Notes that save debugging time:
 
-* **`wait` matches against the screen as it is now**, not against new output. Use a distinctive string, or
-  `--gone` (e.g. a spinner/"esc to interrupt" marker) or `--idle`, rather than text that is already visible.
+* **By default `wait` matches against the screen as it is now**, so text left over from an earlier turn matches
+  immediately. To wait for *new* output use offsets: every app has a monotonically increasing stream **offset**
+  (characters of PTY output so far) shown by `--status`, printed by `--send` (value *before* the send) and
+  `--wait-for` (value at return). `--wait-for ID --text Done --after $OFFSET` (or `--new-only`) only looks at
+  output produced after that point (ANSI stripped; the last ~2M chars are kept). Typical turn:
+  `OFF=$(pty --send $ID --text hi --keys Enter --json | python -c "import sys,json;print(json.load(sys.stdin)['offset'])")`
+  then `pty --wait-for $ID --text "answer" --after $OFF --timeout 60000`, then
+  `pty --wait-for $ID --idle 3000 --min-new-bytes 50 --after $OFF` (quiet for 3 s *and* something new was printed).
+  A TUI that redraws an old string re-emits it, which counts as new output; pick strings the new turn alone produces.
   Screen lines have trailing spaces trimmed, so wait for `>` rather than `> `.
+* **Guards against typing into the wrong terminal**: `--send ID --text "/model" --keys Enter --require "esc to interrupt"`
+  sends nothing (exit 3, HTTP 412) unless the current screen contains the text; `--screen ID --expect "..."`
+  does the same check for reads.
+* **Keep long sessions small**: `--screen ID --full --tail 60` (last 60 non-blank lines of screen+scrollback),
+  `--screen ID --full --grep "error|warn" --ignore-case --tail 20`. Filtering is done server-side.
 * Send **text and Enter separately** (`--text X` then `--keys Enter`, or one call with both:
   `{"text":"X","keys":["Enter"]}` — they are written `delayMs` apart). Many TUIs treat a chunk like `X\r`
   as a paste, and an ESC byte directly followed by another byte reads as Alt+key, which is why keys are
   never batched.
-* **Newlines without submitting**: in line-editor TUIs `M-Enter` (Alt+Enter, `ESC CR`) usually inserts a
-  newline. `--paste` sends CR-separated text wrapped in bracketed-paste markers when the app enabled them
-  — **but Windows ConPTY strips the `ESC[200~`/`ESC[201~` markers from input**, so on Windows the app just
-  receives the text with CRs in one burst; verify how your TUI treats that.
-* Exit codes: a normal exit gives the program's code. On Windows a killed app reports `-1073741510`
-  (`0xC000013A`, "terminated by Ctrl-C"); on POSIX the signal is in `signal`. Exited apps stay readable
-  (final screen, `exitCode`) for the last 20 apps.
+* **Multi-line text into a prompt box**: plain `--paste` sends CR-separated text wrapped in bracketed-paste
+  markers when the app enabled them — **but Windows ConPTY strips the `ESC[200~`/`ESC[201~` markers**, so there
+  the app gets the lines CR-joined in one burst (a bare CR may submit). The robust way is to *type* the lines:
+  `pty --send $ID --paste "line 1
+line 2
+line 3" --newline-as M-Enter --delay 40` writes each line as text with `M-Enter` (Alt+Enter, `ESC CR` — a
+  newline-without-submit in Claude Code and most line editors) between them, then `--keys Enter` submits.
+  `S-Enter` sends CSI-u `ESC[13;2u`, `C-j` a LF, `lf` a raw LF, `literal` the text unchanged. Empty lines are kept.
+  Same over HTTP: `{"paste": "a\nb", "newlineAs": "M-Enter"}`.
+* Exit codes: a normal exit gives the program's code. An app ended by `--kill` / `/kill` has **`killed: true`**
+  and `exitStatus: "killed"` (`"exited"` for a natural exit, `"running"` while alive); its raw `exitCode` is the
+  platform's: on Windows `-1073741510` (`0xC000013A`, STATUS_CONTROL_C_EXIT) — expected, not an error — on POSIX
+  the signal is in `signal`. Test `killed` / `exitStatus`, not the number. Exited apps stay readable (final
+  screen, `exitCode`) for the last 20 apps.
 * Ctrl-C (`C-c`) is delivered to the app as byte `0x03`; it only interrupts if the app reads it
   (raw-mode TUIs do; for others use `--kill`).
 * Windows has no `htop`/`vim`; use `node`, `python -q`, `powershell -NoLogo`, `cmd`, `bash -lc "..."` (Git Bash).
@@ -151,7 +170,7 @@ All bodies/responses are JSON unless noted. Errors are `{ "error": "..." }` with
 
 ### `GET /health`
 ```json
-{ "status": "ok", "apps": 2, "version": "1.1.0", "auth": false }
+{ "status": "ok", "apps": 2, "version": "1.2.0", "auth": false }
 ```
 
 ### `POST /start`
@@ -172,33 +191,39 @@ Only `command` is required. `env` is merged over the server's environment (`null
 { "apps": [ { "id": "...", "name": "bash", "command": "bash", "args": ["-lc", "..."], "pid": 12345,
   "cols": 400, "rows": 40, "cwd": "...", "createdAt": 1794874000000, "clients": 0,
   "running": true, "exited": false, "exitCode": null, "signal": null, "exitedAt": null,
-  "outputBytes": 20413, "lastOutputAt": 1794874012345 } ] }
+  "exitStatus": "running", "killed": false,
+  "outputBytes": 20413, "offset": 20413, "lastOutputAt": 1794874012345 } ] }
 ```
 `all=true` also lists the last 20 exited apps (`exited: true`, `exitCode`).
 
 ### `GET /app/:id/status`
 Same object as one entry of `/apps`. Works for exited apps.
 
-### `GET /app/:id/snapshot[?color=true][&full=true][&format=text]`
+### `GET /app/:id/snapshot[?color=true][&full=true][&format=text][&tail=N][&grep=RE][&ignoreCase=true][&expect=TEXT]`
 ```json
 { "visibleText": "line1\nline2\n...", "visibleLines": ["line1", "line2", "..."],
   "cols": 400, "rows": 40, "pid": 12345, "cursor": { "x": 2, "y": 5 },
   "running": true, "exited": false, "exitCode": null, "signal": null,
-  "outputBytes": 20413, "idleMs": 120 }
+  "outputBytes": 20413, "offset": 20413, "killed": false, "idleMs": 120 }
 ```
 `color=true`: lines carry ANSI SGR codes rebuilt from the cell attributes (bold/dim/italic/underline/inverse,
 palette and 24-bit colours; blank trailing cells trimmed). `full=true` adds `fullText` (scrollback + screen,
 10 000 lines of scrollback kept) and `scrollbackLineCount`. `format=text` returns just the screen as
-`text/plain` with trailing blank rows trimmed (`curl .../snapshot?format=text`). Works for exited apps.
+`text/plain` with trailing blank rows trimmed (`curl .../snapshot?format=text`). `tail`/`grep`/`ignoreCase` filter
+(trailing blanks dropped, then lines whose text matches the regex, then the last N); the JSON then also has
+`lines` and `text`. `expect=TEXT` answers `412` (`{"error": ..., "visibleText": ...}`) if the visible screen lacks it.
+Works for exited apps.
 
-### `GET /app/:id/wait?text=&regex=&gone=&idle=&timeout=&scope=&color=&screen=`
+### `GET /app/:id/wait?text=&regex=&gone=&idle=&timeout=&scope=&color=&screen=&after=&new=&minNewBytes=`
 Returns when **any** given condition holds: `text` (substring on screen), `regex` (JS RegExp source),
 `gone` (substring no longer on screen), `idle` (ms without PTY output; default 500 when no other condition
 is given), or when the app exits / `timeout` ms (default 30000, max 600000) elapse. `scope=full` includes
-scrollback. `screen=false` omits the screen from the reply; `color=true` makes it ANSI.
+scrollback. `screen=false` omits the screen from the reply; `color=true` makes it ANSI. `after=N` (stream offset) or
+`new=true` (= offset at call time) restricts `text`/`regex` to output produced after that point; `minNewBytes=B`
+makes `idle` also require B new characters since then.
 ```json
 { "matched": true, "reason": "text", "elapsedMs": 1840, "exited": false, "exitCode": null,
-  "visibleText": "..." }
+  "offset": 20413, "visibleText": "..." }
 ```
 `reason` is `text | regex | gone | idle | exit | timeout | cancelled`; `matched` is false for the last three.
 A text/regex condition is also checked against the final screen of an exited app. Polls every 50 ms;
@@ -208,10 +233,14 @@ dropping the HTTP connection cancels the wait.
 ```json
 { "text": "hello", "keys": ["Enter"], "delayMs": 30 }
 { "paste": "line one\nline two", "bracketed": true }
+{ "paste": "line one\nline two", "newlineAs": "M-Enter" }
+{ "text": "/model", "keys": ["Enter"], "require": "esc to interrupt" }
 { "keys": ["Escape", "C-c", "Up", "S-Tab", "M-Enter", "F5", "PageDown"] }
 ```
 Order: `text`, then `paste`, then each of `keys`, `delayMs` apart (default 30, max 5000). Unknown key names
-are a `400` and nothing is sent. `409` if the app has exited. Response `{ "ok": true }`.
+are a `400` and nothing is sent. `409` if the app has exited. `require` (visible screen must contain it) failing is a
+`412` with nothing sent. `newlineAs` types the paste line by line (see above). Response `{ "ok": true, "offset": N }`
+where `offset` is the stream offset *before* the send (use it as `after`).
 
 <a id="input"></a>**Key names** (case-insensitive): `Enter`, `Tab`, `Escape`/`Esc`, `Space`, `Backspace`,
 `Delete`, `Insert`, `Up` `Down` `Left` `Right` (honour the app's application-cursor-keys mode), `Home`, `End`,
@@ -228,7 +257,7 @@ may contain escape sequences and is written exactly as given. `paste` converts `
 
 ### `POST /kill` and `POST /app/:id/kill`
 Body `{ "id": "3b1a8fd4" }` (the second form has no body). Kills the app and its whole process tree, waits
-(up to 3 s) until it is gone: `{ "ok": true, "exited": true, "exitCode": -1073741510 }`. Already-exited app: `404`
+(up to 3 s) until it is gone: `{ "ok": true, "exited": true, "exitCode": -1073741510, "killed": true }`. Already-exited app: `404`
 `{ "error": "app already exited", "exitCode": 0 }`.
 
 ## WebSocket `ws://host:port/app/:id[?token=...]`
@@ -249,7 +278,7 @@ Server -> client: `{"type":"output","text":"..."}`, `{"type":"exit","exitCode":0
 A client must send `resize` first (output is buffered for up to 5 s until it does; the reply is the current
 screen). All clients of one app share the PTY and see the same output; any can type. Mouse uses SGR encoding
 (`ESC[<Cb;Cx;CyM`); touch events map to mouse sequences (`tap` = click, `longpress` = right click,
-`swipe` = scroll, `pinch` = ctrl+scroll).
+`swipe` = scroll, `pinch` = ctrl+scroll). Wheel buttons follow SGR: 64 up, 65 down, 66 left, 67 right (+16 with Ctrl).
 
 ## Windows notes
 
