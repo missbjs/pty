@@ -11,8 +11,9 @@ export default defineConfig({
     target: "node20",
     outDir: "dist",
     emptyOutDir: true,
+    minify: false,
     rollupOptions: {
-      external: ["node-pty", "@xterm/headless", "strip-ansi", "ws", "crypto", "http", "fs", "path", "os", "tty", "stream", "events", "util", "child_process", "node:fs", "node:path", "node:child_process"],
+      external: ["node-pty", "@xterm/headless", "strip-ansi", "ws", "crypto", "http", "fs", "path", "os", "tty", "stream", "events", "util", "child_process", "node:fs", "node:path", "node:child_process", "node:http", "url"],
     },
   },
 });
